@@ -1,0 +1,8 @@
+{
+  "comment": "comment", 
+  "type": 1, 
+  "dst": "mon",
+  "remote_time": "2020-03-04 11:25:00", //年月日分秒
+  "terminal_id": 55055,
+  "op_cmd": 0 
+}
