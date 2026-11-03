@@ -65,6 +65,8 @@ constellation_recording = struct('packet_number', zeros(0,1), ...
 recording_start_time = [];
 recording_end_time = [];
 recording_packet_count = 0;
+device_ip = get_saved_device_ip();
+handles.active_device_ip = device_ip;
 handles.tBTN_PlotMap = uicontrol('Parent', hObject, ...
     'Style', 'togglebutton', ...
     'String', 'START', ...
@@ -74,39 +76,128 @@ handles.tBTN_PlotMap = uicontrol('Parent', hObject, ...
     'FontWeight', 'bold', ...
     'Tag', 'tBTN_PlotMap', ...
     'Callback', @(src, event) tBTN_PlotMap_Callback(src, event, guidata(src)));
+handles = add_device_ip_controls(hObject, handles, device_ip);
+guidata(hObject, handles);
 
 %% Log_UESTC
 position = get(handles.BTN_logUESTC,'Position');
-image = imread('Log_UESTC.jpg');   %¶ÁÈ¡Í¼Æ¬ Log_UESTC.png
+image = imread('Log_UESTC.jpg');   %è¯»å–å›¾ç‰‡ Log_UESTC.png
 image = imresize(image, [position(4)*2.85*5, position(3)*5]);
 set(handles.BTN_logUESTC,'CData',image);
 
 %% Global receivr_data
-global t_client
+global t_client g_handles recv_state
+recv_state = 0;
+g_handles = handles;
 % Find a udp object.
-t_client = instrfind('Type', 'udp', 'RemoteHost', '192.168.0.27', 'RemotePort', 5001, 'Tag', '');
+t_client = instrfind('Type', 'udp', 'RemoteHost', device_ip, 'RemotePort', 5001, 'Tag', 'WPR_GUI');
+if isempty(t_client)
+    t_client = instrfind('Type', 'udp', 'RemoteHost', device_ip, 'RemotePort', 5001, 'Tag', '');
+end
 
 % Create the udp object if it does not exist
 % otherwise use the object that was found.
 if isempty(t_client)
-    t_client = udp('192.168.0.27', 5001);
+    t_client = udp(device_ip, 5001);
 else
     fclose(t_client);
     t_client = t_client(1);
 end
 
-% t_client=udp('192.168.0.28','RemotePort',5001);
-t_client.inputbuffersize = 1024*100;
-t_client.OutputBuffersize = 8192;
-t_client.DatagramReceivedFcn = @proc_udp1;
-t_client.EnablePortSharing = 'on';
-fopen(t_client);
+configure_udp_client(t_client);
 
 % Update handles structure
 guidata(hObject, handles);
 
 % UIWAIT makes WPR_GUI wait for user response (see UIRESUME)
 % uiwait(handles.figure1);
+
+
+function handles = add_device_ip_controls(parent, handles, device_ip)
+handles.text_DeviceIP = uicontrol('Parent', parent, ...
+    'Style', 'text', ...
+    'String', 'Board IP', ...
+    'Units', 'characters', ...
+    'Position', [3, 1.7, 12, 2.8], ...
+    'HorizontalAlignment', 'left', ...
+    'FontSize', 9, ...
+    'Tag', 'text_DeviceIP');
+handles.edit_DeviceIP = uicontrol('Parent', parent, ...
+    'Style', 'edit', ...
+    'String', device_ip, ...
+    'Units', 'characters', ...
+    'Position', [15, 1.5, 23, 3.2], ...
+    'BackgroundColor', 'white', ...
+    'FontSize', 9, ...
+    'Tag', 'edit_DeviceIP', ...
+    'TooltipString', 'Enter the ZU27DR board IPv4 address.');
+handles.btn_ApplyIP = uicontrol('Parent', parent, ...
+    'Style', 'pushbutton', ...
+    'String', 'Apply IP', ...
+    'Units', 'characters', ...
+    'Position', [40, 1.5, 25, 3.2], ...
+    'FontSize', 9, ...
+    'Tag', 'btn_ApplyIP', ...
+    'Callback', @BTN_ApplyIP_Callback);
+
+
+function BTN_ApplyIP_Callback(hObject, eventdata)
+handles = guidata(hObject);
+device_ip = strtrim(get(handles.edit_DeviceIP, 'String'));
+if ~is_valid_ipv4_address(device_ip)
+    errordlg('Enter a valid IPv4 address, for example 192.168.0.27.', 'Invalid IP');
+    return;
+end
+
+global t_client recording_active recv_state g_handles
+if ~isempty(recording_active) && recording_active
+    errordlg('Stop constellation recording before changing the board IP.', 'IP change blocked');
+    return;
+end
+
+new_client = [];
+try
+    new_client = udp(device_ip, 5001);
+    configure_udp_client(new_client);
+catch ME
+    if ~isempty(new_client)
+        try
+            fclose(new_client);
+        catch
+        end
+        try
+            delete(new_client);
+        catch
+        end
+    end
+    errordlg(sprintf('Could not open UDP for %s: %s', device_ip, ME.message), 'Connection error');
+    return;
+end
+
+old_client = t_client;
+t_client = new_client;
+if ~isempty(old_client)
+    try
+        fclose(old_client);
+    catch
+    end
+    try
+        delete(old_client);
+    catch
+    end
+end
+
+handles.active_device_ip = device_ip;
+guidata(hObject, handles);
+g_handles = handles;
+recv_state = 0;
+set(handles.text_SYS, 'BackgroundColor', 'r');
+set(handles.BTN_SYS, 'String', 'connect');
+try
+    setpref('XilingZU27DR', 'BoardIP', device_ip);
+catch ME
+    errordlg(sprintf('IP applied, but could not save it for next launch: %s', ME.message), 'Preference error');
+end
 
 
 % --- Outputs from this function are returned to the command line.
@@ -159,11 +250,11 @@ function tBTN_CtrlCon_Callback(hObject, eventdata, handles)
 global t_client
 if(get(handles.tBTN_CtrlCon,'value') == 1)
     fopen(t_client);
-    set(handles.tBTN_CtrlCon,'string','Éè±¸ÒÑÁ¬½Ó');
+    set(handles.tBTN_CtrlCon,'string','è®¾å¤‡å·²è¿žæŽ¥');
     set(handles.tBTN_CtrlCon,'BackgroundColor','g');
 else
     fclose(t_client);
-    set(handles.tBTN_CtrlCon,'string','Éè±¸ÒÑ¶Ï¿ª');
+    set(handles.tBTN_CtrlCon,'string','è®¾å¤‡å·²æ–­å¼€');
     set(handles.tBTN_CtrlCon,'BackgroundColor','r');
 end
 % Hint: get(hObject,'Value') returns toggle state of tBTN_CtrlCon
@@ -250,6 +341,19 @@ global t_client
 
 button_text = get(handles.tBTN_PlotMap, 'string');
 if strcmpi(button_text, 'START')
+    global recv_state
+    requested_ip = strtrim(get(handles.edit_DeviceIP, 'String'));
+    if ~strcmp(requested_ip, handles.active_device_ip)
+        set(hObject, 'value', 0);
+        errordlg('Click Apply IP before starting the constellation capture.', 'IP not applied');
+        return;
+    end
+    if isempty(recv_state) || recv_state ~= 1
+        set(hObject, 'value', 0);
+        errordlg('Complete the system handshake before starting the capture.', 'Device not connected');
+        return;
+    end
+
     constellation_recording = struct('packet_number', zeros(0,1), ...
         'point_number', zeros(0,1), ...
         'receive_time_datenum', zeros(0,1), ...
@@ -299,7 +403,7 @@ else
         'packet_count', recording_packet_count, ...
         'duration_seconds', elapsed_seconds, ...
         'average_point_rate', average_point_rate, ...
-        'source_ip', '192.168.0.27', ...
+        'source_ip', handles.active_device_ip, ...
         'source_port', 5001);
 
     save(fullfile(output_folder, 'constellation_recording.mat'), ...
@@ -347,6 +451,46 @@ function text_PAC_RX_CreateFcn(hObject, eventdata, handles)
 if ispc && isequal(get(hObject,'BackgroundColor'), get(0,'defaultUicontrolBackgroundColor'))
     set(hObject,'BackgroundColor','white');
 end
+
+function device_ip = get_saved_device_ip()
+device_ip = '192.168.0.27';
+if ispref('XilingZU27DR', 'BoardIP')
+    saved_ip = getpref('XilingZU27DR', 'BoardIP');
+    if is_valid_ipv4_address(saved_ip)
+        device_ip = char(saved_ip);
+    end
+end
+
+function valid = is_valid_ipv4_address(ip)
+valid = false;
+if isstring(ip) && isscalar(ip)
+    ip = char(ip);
+end
+if ~ischar(ip) || ~isrow(ip)
+    return;
+end
+parts = regexp(strtrim(ip), '\.', 'split');
+if numel(parts) ~= 4
+    return;
+end
+for k = 1:4
+    if isempty(regexp(parts{k}, '^(0|[1-9][0-9]{0,2})$', 'once'))
+        return;
+    end
+    octet = str2double(parts{k});
+    if octet > 255
+        return;
+    end
+end
+valid = true;
+
+function configure_udp_client(client)
+client.InputBufferSize = 1024 * 100;
+client.OutputBufferSize = 8192;
+client.DatagramReceivedFcn = @proc_udp1;
+client.EnablePortSharing = 'on';
+client.Tag = 'WPR_GUI';
+fopen(client);
 
 % --- Executes during object creation, after setting all properties.
 function text_PAC_TX_CreateFcn(hObject, eventdata, handles)
