@@ -9,6 +9,7 @@ if ~isempty(existing)
 end
 
 deviceIP = get_saved_device_ip();
+modulationConfig = get_modulation_config('QPSK');
 screen = get(0, 'ScreenSize');
 width = min(1480, screen(3) - 80);
 height = min(900, screen(4) - 100);
@@ -19,116 +20,176 @@ fig = figure('Name', 'ZU27DR Metrics Monitor', 'NumberTitle', 'off', ...
     'Position', [left bottom width height], 'Tag', 'WPR_Metrics_GUI', ...
     'CloseRequestFcn', @close_gui);
 
-emptyRecords = struct('packet_number', {}, 'receive_time', {}, ...
+emptyRecords = struct('packet_number', {}, 'modulation', {}, 'receive_time', {}, ...
     'elapsed_seconds', {}, 'pac_tx_cnt', {}, 'pac_rx_cnt', {}, ...
     'pac_rx_crc_ok_cnt', {}, 'pac_rx_crc_err_cnt', {}, 'rms', {}, ...
     'evm_rms_percent', {}, 'mer_db', {}, 'per', {}, 'ber_estimate', {}, ...
     'i_raw', {}, 'q_raw', {}, 'i_normalized', {}, 'q_normalized', {});
-state = struct('active_ip', deviceIP, 'running', false, 'client', [], ...
+% Keep each callback's state local; guidata owns the current capture state.
+initialState = struct('active_ip', deviceIP, 'running', false, 'saving', false, ...
+    'modulation_config', modulationConfig, 'client', [], ...
     'request_timer', [], 'start_time', NaT, 'packet_records', emptyRecords, ...
     'last_rx_count', NaN, 'last_crc_err_count', NaN, ...
     'session_rx_delta', 0, 'session_crc_err_delta', 0, ...
     'output_root', fullfile(fileparts(mfilename('fullpath')), 'constellation_records'), ...
     'metric_lines', gobjects(5, 1), 'metric_axes', gobjects(5, 1));
-evmCalculator = comm.EVM('MaximumEVMOutputPort', true);
-evmCalculator.ReferenceSignalSource = 'Estimated from reference constellation';
-evmCalculator.ReferenceConstellation = qammod(0:3, 4, 'gray', 'UnitAveragePower', true);
-merCalculator = comm.MER('MinimumMEROutputPort', true);
-merCalculator.ReferenceSignalSource = 'Estimated from reference constellation';
-merCalculator.ReferenceConstellation = qammod(0:3, 4, 'gray', 'UnitAveragePower', true);
-state.process_packet = @(packet, receivedAt) process_packet(fig, packet, receivedAt);
-state.stop_capture = @() stop_capture(fig);
-state.decode_frame = @decode_metrics_frame;
-guidata(fig, state);
+[evmCalculator, merCalculator] = create_metric_calculators(modulationConfig.reference_constellation);
+initialState.process_packet = @(packet, receivedAt) process_packet(fig, packet, receivedAt);
+initialState.stop_capture = @() stop_capture(fig);
+initialState.decode_frame = @decode_metrics_frame;
+guidata(fig, initialState);
+
+initialState.modulation_group = uibuttongroup(fig, 'Title', 'Modulation (analysis)', ...
+    'Units', 'normalized', 'Position', [0.025 0.926 0.28 0.065], ...
+    'ForegroundColor', [0.85 0.9 0.85], 'BackgroundColor', [0.02 0.02 0.02], ...
+    'FontSize', 9, 'Tag', 'WPR_Metrics_Modulation');
+modulationNames = {'QPSK', '8PSK', '16QAM'};
+initialState.modulation_buttons = gobjects(3, 1);
+for modulationIndex = 1:numel(modulationNames)
+    initialState.modulation_buttons(modulationIndex) = uicontrol(initialState.modulation_group, ...
+        'Style', 'radiobutton', 'String', modulationNames{modulationIndex}, ...
+        'Tag', modulationNames{modulationIndex}, 'Units', 'normalized', ...
+        'Position', [0.025 + (modulationIndex - 1) * 0.325 0.05 0.32 0.8], ...
+        'ForegroundColor', [0.85 0.9 0.85], ...
+        'BackgroundColor', [0.02 0.02 0.02], 'FontSize', 10);
+end
+set(initialState.modulation_group, 'SelectedObject', initialState.modulation_buttons(1), ...
+    'SelectionChangedFcn', @select_modulation);
+guidata(fig, initialState);
 
 uicontrol(fig, 'Style', 'text', 'String', 'Board IP', ...
-    'Units', 'normalized', 'Position', [0.025 0.932 0.055 0.045], ...
+    'Units', 'normalized', 'Position', [0.32 0.932 0.055 0.045], ...
     'ForegroundColor', [0.85 0.9 0.85], 'BackgroundColor', [0.02 0.02 0.02], ...
     'HorizontalAlignment', 'left', 'FontSize', 10);
-state = guidata(fig);
-state.ip_edit = uicontrol(fig, 'Style', 'edit', 'String', deviceIP, ...
-    'Units', 'normalized', 'Position', [0.082 0.932 0.15 0.047], ...
+initialState = guidata(fig);
+initialState.ip_edit = uicontrol(fig, 'Style', 'edit', 'String', deviceIP, ...
+    'Units', 'normalized', 'Position', [0.377 0.932 0.14 0.047], ...
     'BackgroundColor', 'white', 'ForegroundColor', 'black', 'FontSize', 10, ...
     'Tag', 'WPR_Metrics_IP');
-state.apply_ip_button = uicontrol(fig, 'Style', 'pushbutton', 'String', 'Apply IP', ...
-    'Units', 'normalized', 'Position', [0.24 0.932 0.085 0.047], ...
+initialState.apply_ip_button = uicontrol(fig, 'Style', 'pushbutton', 'String', 'Apply IP', ...
+    'Units', 'normalized', 'Position', [0.525 0.932 0.085 0.047], ...
     'FontSize', 10, 'Callback', @apply_ip);
-state.start_button = uicontrol(fig, 'Style', 'pushbutton', 'String', 'START', ...
-    'Units', 'normalized', 'Position', [0.34 0.932 0.09 0.047], ...
+initialState.start_button = uicontrol(fig, 'Style', 'pushbutton', 'String', 'START', ...
+    'Units', 'normalized', 'Position', [0.625 0.932 0.09 0.047], ...
     'FontSize', 10, 'FontWeight', 'bold', 'Callback', @start_capture);
-state.stop_button = uicontrol(fig, 'Style', 'pushbutton', 'String', 'STOP', ...
-    'Units', 'normalized', 'Position', [0.445 0.932 0.09 0.047], ...
+initialState.stop_button = uicontrol(fig, 'Style', 'pushbutton', 'String', 'STOP', ...
+    'Units', 'normalized', 'Position', [0.73 0.932 0.09 0.047], ...
     'FontSize', 10, 'FontWeight', 'bold', 'Enable', 'off', ...
     'Callback', @stop_capture);
-state.status = uicontrol(fig, 'Style', 'text', 'String', 'Ready', ...
-    'Units', 'normalized', 'Position', [0.56 0.932 0.41 0.047], ...
+initialState.status = uicontrol(fig, 'Style', 'text', 'String', 'Ready', ...
+    'Units', 'normalized', 'Position', [0.035 0.9 0.93 0.023], ...
     'ForegroundColor', [0.35 0.95 0.45], 'BackgroundColor', [0.02 0.02 0.02], ...
     'HorizontalAlignment', 'left', 'FontSize', 10, 'Tag', 'WPR_Metrics_Status');
-guidata(fig, state);
+guidata(fig, initialState);
 
-state = guidata(fig);
-state.live_text = uicontrol(fig, 'Style', 'text', 'String', 'No packets received', ...
-    'Units', 'normalized', 'Position', [0.035 0.86 0.93 0.052], ...
+initialState = guidata(fig);
+initialState.live_text = uicontrol(fig, 'Style', 'text', 'String', 'No packets received', ...
+    'Units', 'normalized', 'Position', [0.035 0.84 0.93 0.052], ...
     'ForegroundColor', [0.35 0.95 0.45], 'BackgroundColor', [0.02 0.02 0.02], ...
     'HorizontalAlignment', 'left', 'FontName', 'Consolas', 'FontSize', 10);
-guidata(fig, state);
+guidata(fig, initialState);
 
 constellationAxes = axes('Parent', fig, 'Units', 'normalized', ...
-    'Position', [0.045 0.18 0.56 0.65], 'Color', 'k', ...
+    'Position', [0.045 0.155 0.56 0.64], 'Color', 'k', ...
     'XColor', [0.25 0.9 0.35], 'YColor', [0.25 0.9 0.35], ...
     'FontSize', 10, 'Box', 'on');
 hold(constellationAxes, 'on');
-state.constellation_line = plot(constellationAxes, NaN, NaN, '.', ...
+initialState.constellation_line = plot(constellationAxes, NaN, NaN, '.', ...
     'Color', [1 0.7 0], 'MarkerSize', 9, 'Tag', 'WPR_Metrics_Constellation');
-state.constellation_axes = constellationAxes;
-guidata(fig, state);
-reference = qammod(0:3, 4, 'gray', 'UnitAveragePower', true);
-plot(constellationAxes, real(reference), imag(reference), 'r+', ...
-    'LineWidth', 1.5, 'MarkerSize', 10);
+initialState.constellation_axes = constellationAxes;
+reference = modulationConfig.reference_constellation;
+initialState.reference_line = plot(constellationAxes, real(reference), imag(reference), 'r+', ...
+    'LineWidth', 1.5, 'MarkerSize', 10, 'Tag', 'WPR_Metrics_Reference');
+guidata(fig, initialState);
 axis(constellationAxes, [-2 2 -2 2]);
 axis(constellationAxes, 'square');
 grid(constellationAxes, 'on');
 set(constellationAxes, 'GridColor', [0.15 0.5 0.2]);
 xlabel(constellationAxes, 'In-phase');
 ylabel(constellationAxes, 'Quadrature');
-title(constellationAxes, 'Constellation (QAM-4)', 'Color', [0.25 0.9 0.35]);
+title(constellationAxes, 'Constellation (QPSK)', 'Color', [0.25 0.9 0.35]);
 
 metricNames = {'EVM RMS (%)', 'PER', 'BER estimate', 'MER (dB)', 'Rx IF Power (dB)'};
 metricColors = [1 0.7 0; 1 0.3 0.25; 0.25 0.8 1; 0.25 0.9 0.45; 1 0.55 0.2];
-metricY = [0.735 0.592 0.449 0.306 0.163];
+metricY = [0.70 0.558 0.416 0.274 0.132];
 for metricIndex = 1:numel(metricNames)
     ax = axes('Parent', fig, 'Units', 'normalized', ...
-        'Position', [0.665 metricY(metricIndex) 0.29 0.12], 'Color', 'k', ...
+        'Position', [0.665 metricY(metricIndex) 0.29 0.105], 'Color', 'k', ...
         'XColor', [0.75 0.85 0.75], 'YColor', [0.75 0.85 0.75], ...
         'FontSize', 8, 'Box', 'on');
+    hold(ax, 'on');
     lineHandle = plot(ax, NaN, NaN, 'LineWidth', 1.5, 'Color', metricColors(metricIndex, :));
     grid(ax, 'on');
     set(ax, 'GridColor', [0.15 0.35 0.18]);
     title(ax, metricNames{metricIndex}, 'Color', metricColors(metricIndex, :), 'FontSize', 9);
-    xlabel(ax, 'Time (s)', 'FontSize', 8);
-    state = guidata(fig);
-    state.metric_axes(metricIndex) = ax;
-    state.metric_lines(metricIndex) = lineHandle;
-    guidata(fig, state);
+    if metricIndex == numel(metricNames)
+        xlabel(ax, 'Time (s)', 'FontSize', 8);
+    end
+    initialState = guidata(fig);
+    initialState.metric_axes(metricIndex) = ax;
+    initialState.metric_lines(metricIndex) = lineHandle;
+    guidata(fig, initialState);
 end
 
 uicontrol(fig, 'Style', 'text', ...
-    'String', 'Rx IF Power is the board-reported rms field; BER is estimated from PER.', ...
-    'Units', 'normalized', 'Position', [0.045 0.09 0.91 0.035], ...
+    'String', ['Match the analysis modulation to the board setting; this GUI does not configure the board.' newline ...
+    'Rx IF Power is the board-reported rms field; BER is estimated from PER.'], ...
+    'Units', 'normalized', 'Position', [0.045 0.04 0.91 0.05], ...
     'ForegroundColor', [0.7 0.7 0.7], 'BackgroundColor', [0.02 0.02 0.02], ...
     'HorizontalAlignment', 'left', 'FontSize', 9);
 
+function select_modulation(~, event)
+    state = guidata(fig);
+    if state.running || state.saving
+        selected = findobj(state.modulation_buttons, 'Tag', state.modulation_config.name);
+        set(state.modulation_group, 'SelectedObject', selected);
+        return;
+    end
+    requestedConfig = get_modulation_config(get(event.NewValue, 'Tag'));
+    release(evmCalculator);
+    release(merCalculator);
+    [evmCalculator, merCalculator] = create_metric_calculators(requestedConfig.reference_constellation);
+    state.modulation_config = requestedConfig;
+    state.packet_records = state.packet_records([]);
+    state.start_time = NaT;
+    reference = requestedConfig.reference_constellation;
+    set(state.reference_line, 'XData', real(reference), 'YData', imag(reference));
+    title(state.constellation_axes, ['Constellation (' requestedConfig.name ')'], ...
+        'Color', [0.25 0.9 0.35]);
+    clear_display(state, 'No packets received');
+    set(state.status, 'String', ['Analysis: ' requestedConfig.name ' | Match the board modulation before START'], ...
+        'ForegroundColor', [0.35 0.95 0.45]);
+    guidata(fig, state);
+end
+
+function clear_display(state, message)
+    set(state.constellation_line, 'XData', NaN, 'YData', NaN);
+    for lineIndex = 1:numel(state.metric_lines)
+        set(state.metric_lines(lineIndex), 'XData', NaN, 'YData', NaN);
+        set(state.metric_axes(lineIndex), 'XLim', [0 1], 'YLimMode', 'auto');
+    end
+    set(state.live_text, 'String', message);
+end
+
+function set_capture_controls(state, busy)
+    if busy
+        enabled = 'off';
+    else
+        enabled = 'on';
+    end
+    set([state.start_button; state.apply_ip_button; state.ip_edit; ...
+        state.modulation_buttons(:)], 'Enable', enabled);
+end
+
 function apply_ip(~, ~)
     state = guidata(fig);
+    if state.running || state.saving
+        return;
+    end
     requestedIP = strtrim(get(state.ip_edit, 'String'));
     if ~is_valid_ipv4_address(requestedIP)
         set(state.status, 'String', 'Invalid IPv4 address', ...
             'ForegroundColor', [1 0.3 0.25]);
-        return;
-    end
-    if state.running
-        set(state.status, 'String', 'Stop capture before changing IP', ...
-            'ForegroundColor', [1 0.7 0]);
         return;
     end
     state.active_ip = requestedIP;
@@ -140,6 +201,9 @@ end
 
 function start_capture(~, ~)
     state = guidata(fig);
+    if state.running || state.saving
+        return;
+    end
     requestedIP = strtrim(get(state.ip_edit, 'String'));
     if ~is_valid_ipv4_address(requestedIP)
         set(state.status, 'String', 'Enter a valid IPv4 address', ...
@@ -158,16 +222,10 @@ function start_capture(~, ~)
     state.last_crc_err_count = NaN;
     state.session_rx_delta = 0;
     state.session_crc_err_delta = 0;
-    set(state.constellation_line, 'XData', NaN, 'YData', NaN);
-    for lineIndex = 1:numel(state.metric_lines)
-        set(state.metric_lines(lineIndex), 'XData', NaN, 'YData', NaN);
-    end
-    set(state.live_text, 'String', 'Waiting for packets ...');
+    clear_display(state, 'Waiting for packets ...');
     state.running = true;
-    set(state.start_button, 'Enable', 'off');
+    set_capture_controls(state, true);
     set(state.stop_button, 'Enable', 'on');
-    set(state.apply_ip_button, 'Enable', 'off');
-    set(state.ip_edit, 'Enable', 'off');
     set(state.status, 'String', ['Opening UDP to ' state.active_ip ':5001 ...'], ...
         'ForegroundColor', [1 0.7 0]);
     guidata(fig, state);
@@ -175,6 +233,9 @@ function start_capture(~, ~)
     client = [];
     timerHandle = [];
     try
+        release(evmCalculator);
+        release(merCalculator);
+        [evmCalculator, merCalculator] = create_metric_calculators(state.modulation_config.reference_constellation);
         client = udp(state.active_ip, 5001);
         client.InputBufferSize = 1024 * 100;
         client.OutputBufferSize = 8192;
@@ -199,10 +260,8 @@ function start_capture(~, ~)
         stop_timer(timerHandle);
         state.client = [];
         state.request_timer = [];
-        set(state.start_button, 'Enable', 'on');
+        set_capture_controls(state, false);
         set(state.stop_button, 'Enable', 'off');
-        set(state.apply_ip_button, 'Enable', 'on');
-        set(state.ip_edit, 'Enable', 'on');
         set(state.status, 'String', ['UDP start failed: ' ME.message], ...
             'ForegroundColor', [1 0.3 0.25]);
         guidata(fig, state);
@@ -274,8 +333,8 @@ function process_packet(~, packet, receivedAt)
     if isempty(iRaw)
         return;
     end
-    iNormalized = iRaw ./ 150 ./ sqrt(2);
-    qNormalized = qRaw ./ 150 ./ sqrt(2);
+    iNormalized = iRaw ./ state.modulation_config.normalization_divisor;
+    qNormalized = qRaw ./ state.modulation_config.normalization_divisor;
     symbols = iNormalized + 1i .* qNormalized;
     [evmRms, ~] = evmCalculator(symbols);
     [merDb, ~] = merCalculator(symbols);
@@ -306,7 +365,8 @@ function process_packet(~, packet, receivedAt)
 
     packetNumber = numel(state.packet_records) + 1;
     elapsed = seconds(receivedAt - state.start_time);
-    record = struct('packet_number', packetNumber, 'receive_time', receivedAt, ...
+    record = struct('packet_number', packetNumber, 'modulation', state.modulation_config.name, ...
+        'receive_time', receivedAt, ...
         'elapsed_seconds', elapsed, 'pac_tx_cnt', double(packet.pac_tx_cnt), ...
         'pac_rx_cnt', rxCount, 'pac_rx_crc_ok_cnt', double(packet.pac_rx_crc_ok_cnt), ...
         'pac_rx_crc_err_cnt', crcErrorCount, 'rms', double(packet.rms), ...
@@ -330,9 +390,9 @@ function process_packet(~, packet, receivedAt)
         end
     end
     set(state.live_text, 'String', sprintf([ ...
-        'Recorded packets: %d | I/Q points: %d | Tx: %.0f | Rx: %.0f | CRC OK: %.0f | CRC ERR: %.0f\n' ...
+        '%s | Recorded packets: %d | I/Q points: %d | Tx: %.0f | Rx: %.0f | CRC OK: %.0f | CRC ERR: %.0f\n' ...
         'EVM RMS: %.3f %% | MER: %.3f dB | PER: %.4e | BER estimate: %.4e | Rx IF Power: %.3f dB'], ...
-        packetCount, total_point_count(state.packet_records), ...
+        state.modulation_config.name, packetCount, total_point_count(state.packet_records), ...
         double(packet.pac_tx_cnt), rxCount, double(packet.pac_rx_crc_ok_cnt), ...
         crcErrorCount, evmRms, merDb, per, berEstimate, double(packet.rms)));
     guidata(fig, state);
@@ -348,26 +408,29 @@ function stop_capture(~, ~)
         return;
     end
     state.running = false;
+    state.saving = true;
+    guidata(fig, state);
     stop_timer(state.request_timer);
     state.request_timer = [];
     close_client(state.client);
     state.client = [];
-    set(state.start_button, 'Enable', 'on');
     set(state.stop_button, 'Enable', 'off');
-    set(state.apply_ip_button, 'Enable', 'on');
-    set(state.ip_edit, 'Enable', 'on');
+    set_capture_controls(state, true);
     set(state.status, 'String', 'Saving capture ...', 'ForegroundColor', [1 0.7 0]);
     guidata(fig, state);
     try
         outputFolder = create_record_folder(state.output_root);
         [packetMetrics, constellationPoints, packetRecords, metadata] = ...
             build_record_tables(state.packet_records, state.start_time, ...
-            datetime('now', 'Format', 'yyyy-MM-dd HH:mm:ss.SSS'), state.active_ip);
+            datetime('now', 'Format', 'yyyy-MM-dd HH:mm:ss.SSS'), ...
+            state.active_ip, state.modulation_config);
         save(fullfile(outputFolder, 'metrics_recording.mat'), ...
             'packetRecords', 'packetMetrics', 'constellationPoints', 'metadata', '-v7.3');
         writetable(packetMetrics, fullfile(outputFolder, 'packet_metrics.csv'));
         writetable(constellationPoints, fullfile(outputFolder, 'constellation_points.csv'));
-        exportgraphics(fig, fullfile(outputFolder, 'dashboard.png'), 'Resolution', 150);
+        % print includes the modulation controls and live values in the image.
+        set(fig, 'InvertHardcopy', 'off', 'PaperPositionMode', 'auto');
+        print(fig, fullfile(outputFolder, 'dashboard.png'), '-dpng', '-r150');
         state = guidata(fig);
         set(state.status, 'String', sprintf('Saved %d packets / %d points: %s', ...
             height(packetMetrics), height(constellationPoints), outputFolder), ...
@@ -379,21 +442,62 @@ function stop_capture(~, ~)
             'ForegroundColor', [1 0.3 0.25]);
         guidata(fig, state);
     end
+    state = guidata(fig);
+    state.saving = false;
+    set_capture_controls(state, false);
+    guidata(fig, state);
 end
 
 function close_gui(hObject, ~)
     state = guidata(fig);
+    if state.saving
+        return;
+    end
     if state.running
         stop_capture([], []);
     else
         stop_timer(state.request_timer);
         close_client(state.client);
     end
+    release(evmCalculator);
+    release(merCalculator);
     if ishandle(hObject)
         delete(hObject);
     end
 end
 
+end
+
+function config = get_modulation_config(name)
+% Analysis defaults only: confirm gain and phase against the actual board.
+switch name
+    case 'QPSK'
+        order = 4;
+        phaseOffset = pi / 4;
+        reference = qammod(0:3, 4, 'gray', 'UnitAveragePower', true);
+    case '8PSK'
+        order = 8;
+        phaseOffset = pi / 8;
+        reference = pskmod(0:7, 8, phaseOffset, 'gray');
+    case '16QAM'
+        order = 16;
+        phaseOffset = 0;
+        reference = qammod(0:15, 16, 'gray', 'UnitAveragePower', true);
+    otherwise
+        error('Unsupported modulation: %s', name);
+end
+config = struct('name', name, 'order', order, ...
+    'reference_constellation', reference(:), 'phase_offset_rad', phaseOffset, ...
+    'normalization_divisor', 150 * sqrt(2));
+end
+
+function [evmCalculator, merCalculator] = create_metric_calculators(reference)
+evmCalculator = comm.EVM('MaximumEVMOutputPort', true, ...
+    'ReferenceSignalSource', 'Estimated from reference constellation', ...
+    'ReferenceConstellation', reference);
+merCalculator = comm.MER('MinimumMEROutputPort', true, ...
+    'ReferenceSignalSource', 'Estimated from reference constellation', ...
+    'ReferenceConstellation', reference);
 end
 
 function [frameType, packet] = decode_metrics_frame(bytes)
@@ -477,12 +581,12 @@ end
 end
 
 function [packetMetrics, constellationPoints, packetRecords, metadata] = ...
-        build_record_tables(records, startTime, endTime, deviceIP)
+        build_record_tables(records, startTime, endTime, deviceIP, modulationConfig)
 packetRecords = records;
 packetCount = numel(records);
 if packetCount == 0
     packet_number = zeros(0, 1);
-    receive_time = NaT(0, 1);
+    receive_time = NaT(0, 1, 'Format', 'yyyy-MM-dd HH:mm:ss.SSS');
     elapsed_seconds = zeros(0, 1);
     pac_tx_cnt = zeros(0, 1);
     pac_rx_cnt = zeros(0, 1);
@@ -510,11 +614,12 @@ end
 packetMetrics = table(packet_number, receive_time, elapsed_seconds, pac_tx_cnt, ...
     pac_rx_cnt, pac_rx_crc_ok_cnt, pac_rx_crc_err_cnt, rms, evm_rms_percent, ...
     mer_db, per, ber_estimate);
+packetMetrics.modulation = repmat(string(modulationConfig.name), packetCount, 1);
 
 pointCount = total_point_count(records);
 point_packet_number = zeros(pointCount, 1);
 point_number = zeros(pointCount, 1);
-point_receive_time = NaT(pointCount, 1);
+point_receive_time = NaT(pointCount, 1, 'Format', 'yyyy-MM-dd HH:mm:ss.SSS');
 i_raw = zeros(pointCount, 1);
 q_raw = zeros(pointCount, 1);
 i_normalized = zeros(pointCount, 1);
@@ -536,6 +641,7 @@ constellationPoints = table(point_packet_number, point_number, point_receive_tim
     i_raw, q_raw, i_normalized, q_normalized, 'VariableNames', ...
     {'packet_number', 'point_number', 'receive_time', 'i_raw', 'q_raw', ...
     'i_normalized', 'q_normalized'});
+constellationPoints.modulation = repmat(string(modulationConfig.name), pointCount, 1);
 if ~isempty(startTime) && ~isnat(startTime) && ~isempty(endTime) && ~isnat(endTime)
     durationSeconds = max(0, seconds(endTime - startTime));
 else
@@ -546,6 +652,12 @@ metadata = struct('source_ip', deviceIP, 'source_port', 5001, ...
     'duration_seconds', durationSeconds, 'packet_count', packetCount, ...
     'point_count', pointCount, 'ber_type', 'PER-derived estimate', ...
     'ber_packet_length_bits', 108000, ...
+    'modulation', modulationConfig.name, 'modulation_order', modulationConfig.order, ...
+    'reference_constellation', modulationConfig.reference_constellation, ...
+    'reference_phase_offset_rad', modulationConfig.phase_offset_rad, ...
+    'normalization_divisor', modulationConfig.normalization_divisor, ...
+    'normalization_definition', '(i_raw + 1i*q_raw) / normalization_divisor; no gain or phase fitting.', ...
+    'board_modulation_controlled', false, ...
     'receive_time_definition', 'Computer UDP callback time; points in a packet share the time.');
 end
 
