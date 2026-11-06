@@ -11,31 +11,35 @@ end
 deviceIP = get_saved_device_ip();
 modulationConfig = get_modulation_config('QPSK');
 screen = get(0, 'ScreenSize');
-width = min(1480, screen(3) - 80);
-height = min(900, screen(4) - 100);
-left = max(20, (screen(3) - width) / 2);
-bottom = max(30, (screen(4) - height) / 2);
+windowWidth = min(1480, screen(3) - 80);
+windowHeight = min(900, screen(4) - 100);
+left = max(20, (screen(3) - windowWidth) / 2);
+bottom = max(30, (screen(4) - windowHeight) / 2);
 fig = figure('Name', 'ZU27DR Metrics Monitor', 'NumberTitle', 'off', ...
     'MenuBar', 'none', 'Color', [0.02 0.02 0.02], ...
-    'Position', [left bottom width height], 'Tag', 'WPR_Metrics_GUI', ...
+    'Position', [left bottom windowWidth windowHeight], 'Tag', 'WPR_Metrics_GUI', ...
     'CloseRequestFcn', @close_gui);
 
 emptyRecords = struct('packet_number', {}, 'modulation', {}, 'receive_time', {}, ...
     'elapsed_seconds', {}, 'pac_tx_cnt', {}, 'pac_rx_cnt', {}, ...
     'pac_rx_crc_ok_cnt', {}, 'pac_rx_crc_err_cnt', {}, 'rms', {}, ...
-    'evm_rms_percent', {}, 'mer_db', {}, 'per', {}, 'ber_estimate', {}, ...
+    'evm_rms_percent', {}, 'mer_db', {}, 'per', {}, 'per_upper_95', {}, ...
+    'per_sample_count', {}, 'per_error_count', {}, 'ber_estimate', {}, ...
     'i_raw', {}, 'q_raw', {}, 'i_normalized', {}, 'q_normalized', {});
 % Keep each callback's state local; guidata owns the current capture state.
-initialState = struct('active_ip', deviceIP, 'running', false, 'saving', false, ...
+initialState = struct('active_ip', deviceIP, 'running', false, 'saving', false, 'stopping', false, ...
     'modulation_config', modulationConfig, 'client', [], ...
     'request_timer', [], 'start_time', NaT, 'packet_records', emptyRecords, ...
+    'pending_capture', [], 'last_output_folder', '', ...
     'last_rx_count', NaN, 'last_crc_err_count', NaN, ...
     'session_rx_delta', 0, 'session_crc_err_delta', 0, ...
     'output_root', fullfile(fileparts(mfilename('fullpath')), 'constellation_records'), ...
-    'metric_lines', gobjects(5, 1), 'metric_axes', gobjects(5, 1));
+    'metric_lines', gobjects(5, 1), 'metric_axes', gobjects(5, 1), ...
+    'metric_values', gobjects(5, 1), 'summary_values', gobjects(8, 1));
 [evmCalculator, merCalculator] = create_metric_calculators(modulationConfig.reference_constellation);
 initialState.process_packet = @(packet, receivedAt) process_packet(fig, packet, receivedAt);
 initialState.stop_capture = @() stop_capture(fig);
+initialState.save_capture = @() save_capture(fig, []);
 initialState.decode_frame = @decode_metrics_frame;
 guidata(fig, initialState);
 
@@ -51,7 +55,8 @@ for modulationIndex = 1:numel(modulationNames)
         'Tag', modulationNames{modulationIndex}, 'Units', 'normalized', ...
         'Position', [0.025 + (modulationIndex - 1) * 0.325 0.05 0.32 0.8], ...
         'ForegroundColor', [0.85 0.9 0.85], ...
-        'BackgroundColor', [0.02 0.02 0.02], 'FontSize', 10);
+        'BackgroundColor', [0.02 0.02 0.02], 'FontSize', 10, ...
+        'TooltipString', 'Match the board modulation; this selection only changes GUI analysis.');
 end
 set(initialState.modulation_group, 'SelectedObject', initialState.modulation_buttons(1), ...
     'SelectionChangedFcn', @select_modulation);
@@ -76,17 +81,27 @@ initialState.stop_button = uicontrol(fig, 'Style', 'pushbutton', 'String', 'STOP
     'Units', 'normalized', 'Position', [0.73 0.932 0.09 0.047], ...
     'FontSize', 10, 'FontWeight', 'bold', 'Enable', 'off', ...
     'Callback', @stop_capture);
-initialState.status = uicontrol(fig, 'Style', 'text', 'String', 'Ready', ...
-    'Units', 'normalized', 'Position', [0.035 0.9 0.93 0.023], ...
+initialState.save_button = uicontrol(fig, 'Style', 'pushbutton', 'String', 'SAVE', ...
+    'Units', 'normalized', 'Position', [0.845 0.932 0.115 0.047], ...
+    'FontSize', 12, 'FontWeight', 'bold', 'Enable', 'off', ...
+    'BackgroundColor', [0.72 0.72 0.72], 'ForegroundColor', [0.35 0.35 0.35], ...
+    'TooltipString', 'Save the completed START-to-STOP capture.', 'Callback', @save_capture);
+initialState.status = uicontrol(fig, 'Style', 'text', 'String', '就绪', ...
+    'Units', 'normalized', 'Position', [0.035 0.885 0.93 0.03], ...
     'ForegroundColor', [0.35 0.95 0.45], 'BackgroundColor', [0.02 0.02 0.02], ...
-    'HorizontalAlignment', 'left', 'FontSize', 10, 'Tag', 'WPR_Metrics_Status');
+    'HorizontalAlignment', 'left', 'FontSize', 11, 'Tag', 'WPR_Metrics_Status');
 guidata(fig, initialState);
 
-initialState = guidata(fig);
-initialState.live_text = uicontrol(fig, 'Style', 'text', 'String', 'No packets received', ...
-    'Units', 'normalized', 'Position', [0.035 0.84 0.93 0.052], ...
-    'ForegroundColor', [0.35 0.95 0.45], 'BackgroundColor', [0.02 0.02 0.02], ...
-    'HorizontalAlignment', 'left', 'FontName', 'Consolas', 'FontSize', 10);
+summaryPositions = [0.045 0.062 0.18 0.036; 0.235 0.062 0.18 0.036; ...
+    0.425 0.062 0.21 0.036; 0.045 0.018 0.075 0.036; ...
+    0.125 0.018 0.115 0.036; 0.245 0.018 0.115 0.036; ...
+    0.365 0.018 0.14 0.036; 0.51 0.018 0.15 0.036];
+for summaryIndex = 1:8
+    initialState.summary_values(summaryIndex) = uicontrol(fig, 'Style', 'text', ...
+        'Units', 'normalized', 'Position', summaryPositions(summaryIndex, :), ...
+        'ForegroundColor', [0.8 0.85 0.9], 'BackgroundColor', [0.02 0.02 0.02], ...
+        'HorizontalAlignment', 'left', 'FontSize', 11);
+end
 guidata(fig, initialState);
 
 constellationAxes = axes('Parent', fig, 'Units', 'normalized', ...
@@ -109,40 +124,75 @@ xlabel(constellationAxes, 'In-phase');
 ylabel(constellationAxes, 'Quadrature');
 title(constellationAxes, 'Constellation (QPSK)', 'Color', [0.25 0.9 0.35]);
 
-metricNames = {'EVM RMS (%)', 'PER', 'BER estimate', 'MER (dB)', 'Rx IF Power (dB)'};
+metricNames = {'EVM RMS', 'PER 95% 上限', 'BER estimate', 'MER', 'Rx IF Power'};
+metricTips = {'EVM RMS in percent, using the selected reference constellation.', ...
+    ['Pointwise 95% one-sided Clopper-Pearson upper bound; assumes independent packets with a constant error probability. ' ...
+    'The first report sets the counter baseline; no statistical packets or inconsistent counters show --.'], ...
+    'BER estimate derived from observed PER with 108000 bits per packet; not measured BER or a confidence bound.', ...
+    'MER in dB, using the selected reference constellation.', ...
+    'Board-reported rms field in dB; this is not calibrated RSSI.'};
 metricColors = [1 0.7 0; 1 0.3 0.25; 0.25 0.8 1; 0.25 0.9 0.45; 1 0.55 0.2];
-metricY = [0.70 0.558 0.416 0.274 0.132];
+metricY = [0.708 0.556 0.404 0.252 0.100];
 for metricIndex = 1:numel(metricNames)
+    plotHeight = 0.105;
+    if metricIndex == 2
+        plotHeight = 0.081; % Leave a separate line for observed PER and K/N.
+    end
     ax = axes('Parent', fig, 'Units', 'normalized', ...
-        'Position', [0.665 metricY(metricIndex) 0.29 0.105], 'Color', 'k', ...
+        'Position', [0.665 metricY(metricIndex) 0.29 plotHeight], 'Color', 'k', ...
         'XColor', [0.75 0.85 0.75], 'YColor', [0.75 0.85 0.75], ...
         'FontSize', 8, 'Box', 'on');
     hold(ax, 'on');
     lineHandle = plot(ax, NaN, NaN, 'LineWidth', 1.5, 'Color', metricColors(metricIndex, :));
     grid(ax, 'on');
     set(ax, 'GridColor', [0.15 0.35 0.18]);
-    title(ax, metricNames{metricIndex}, 'Color', metricColors(metricIndex, :), 'FontSize', 9);
+    % Keep scientific notation on each tick, away from the metric heading.
+    ax.YAxis.Exponent = 0;
+    ytickformat(ax, '%g');
+    headerOffset = 0.001;
+    headerHeight = 0.036;
+    if metricIndex == 2
+        headerOffset = headerOffset + 0.029;
+    end
+    headerPosition = [0.665 metricY(metricIndex) + plotHeight + headerOffset 0.14 headerHeight];
+    uicontrol(fig, 'Style', 'text', 'String', metricNames{metricIndex}, ...
+        'Units', 'normalized', 'Position', headerPosition, ...
+        'HorizontalAlignment', 'left', 'FontSize', 11, ...
+        'BackgroundColor', [0.02 0.02 0.02], 'ForegroundColor', metricColors(metricIndex, :), ...
+        'TooltipString', metricTips{metricIndex});
+    initialState = guidata(fig);
+    initialState.metric_values(metricIndex) = uicontrol(fig, 'Style', 'text', 'String', '--', ...
+        'Units', 'normalized', 'Position', [0.805 headerPosition(2) 0.15 headerHeight], ...
+        'HorizontalAlignment', 'right', 'FontSize', 12, ...
+        'BackgroundColor', [0.02 0.02 0.02], 'ForegroundColor', metricColors(metricIndex, :), ...
+        'TooltipString', metricTips{metricIndex});
+    if metricIndex == 2
+        initialState.per_details = uicontrol(fig, 'Style', 'text', ...
+            'String', '观测 PER --  本轮错包/收包 0/0', ...
+            'Units', 'normalized', 'Position', [0.665 metricY(metricIndex) + plotHeight + 0.001 0.30 0.028], ...
+            'HorizontalAlignment', 'left', 'FontSize', 9, ...
+            'BackgroundColor', [0.02 0.02 0.02], 'ForegroundColor', metricColors(metricIndex, :), ...
+            'TooltipString', ['K/N uses cumulative changes in board pac_rx_crc_err_cnt/pac_rx_cnt since START, ' ...
+            'not UDP report count or constellation point count. Board counter semantics require hardware verification.']);
+    end
     if metricIndex == numel(metricNames)
         xlabel(ax, 'Time (s)', 'FontSize', 8);
+    else
+        set(ax, 'XTickLabel', []);
     end
-    initialState = guidata(fig);
     initialState.metric_axes(metricIndex) = ax;
     initialState.metric_lines(metricIndex) = lineHandle;
     guidata(fig, initialState);
 end
 
-uicontrol(fig, 'Style', 'text', ...
-    'String', ['Match the analysis modulation to the board setting; this GUI does not configure the board.' newline ...
-    'Rx IF Power is the board-reported rms field; BER is estimated from PER.'], ...
-    'Units', 'normalized', 'Position', [0.045 0.04 0.91 0.05], ...
-    'ForegroundColor', [0.7 0.7 0.7], 'BackgroundColor', [0.02 0.02 0.02], ...
-    'HorizontalAlignment', 'left', 'FontSize', 9);
+clear_display(guidata(fig));
 
 function select_modulation(~, event)
     state = guidata(fig);
-    if state.running || state.saving
+    if state.running || state.saving || state.stopping
         selected = findobj(state.modulation_buttons, 'Tag', state.modulation_config.name);
         set(state.modulation_group, 'SelectedObject', selected);
+        sync_modulation_buttons(state);
         return;
     end
     requestedConfig = get_modulation_config(get(event.NewValue, 'Tag'));
@@ -150,25 +200,71 @@ function select_modulation(~, event)
     release(merCalculator);
     [evmCalculator, merCalculator] = create_metric_calculators(requestedConfig.reference_constellation);
     state.modulation_config = requestedConfig;
+    sync_modulation_buttons(state);
     state.packet_records = state.packet_records([]);
     state.start_time = NaT;
     reference = requestedConfig.reference_constellation;
     set(state.reference_line, 'XData', real(reference), 'YData', imag(reference));
     title(state.constellation_axes, ['Constellation (' requestedConfig.name ')'], ...
         'Color', [0.25 0.9 0.35]);
-    clear_display(state, 'No packets received');
-    set(state.status, 'String', ['Analysis: ' requestedConfig.name ' | Match the board modulation before START'], ...
-        'ForegroundColor', [0.35 0.95 0.45]);
+    clear_display(state);
+    show_idle_status(state, ['Analysis: ' requestedConfig.name]);
     guidata(fig, state);
 end
 
-function clear_display(state, message)
+function sync_modulation_buttons(state)
+    % Keep all radio Values consistent when rejecting a queued selection.
+    for button = state.modulation_buttons.'
+        set(button, 'Value', strcmp(get(button, 'Tag'), state.modulation_config.name));
+    end
+end
+
+function clear_display(state)
     set(state.constellation_line, 'XData', NaN, 'YData', NaN);
     for lineIndex = 1:numel(state.metric_lines)
         set(state.metric_lines(lineIndex), 'XData', NaN, 'YData', NaN);
         set(state.metric_axes(lineIndex), 'XLim', [0 1], 'YLimMode', 'auto');
     end
-    set(state.live_text, 'String', message);
+    set(state.metric_values, 'String', '--');
+    set(state.per_details, 'String', '观测 PER --  本轮错包/收包 0/0');
+    update_summary(state, 0);
+end
+
+function update_summary(state, elapsed)
+    packets = numel(state.packet_records);
+    counts = zeros(1, 4);
+    if packets > 0
+        last = state.packet_records(end);
+        counts = [last.pac_tx_cnt last.pac_rx_cnt last.pac_rx_crc_ok_cnt last.pac_rx_crc_err_cnt];
+    end
+    labels = {sprintf('UDP %d包', packets), ...
+        sprintf('点 %d', total_point_count(state.packet_records)), ...
+        sprintf('时长 %.2f s', max(0, elapsed)), ...
+        '板卡累计', sprintf('Tx %.0f', counts(1)), sprintf('Rx %.0f', counts(2)), ...
+        sprintf('CRC OK %.0f', counts(3)), sprintf('CRC ERR %.0f', counts(4))};
+    for index = 1:8
+        set(state.summary_values(index), 'String', labels{index});
+    end
+end
+
+function update_save_button(state)
+    if ~state.running && ~state.saving && ~isempty(state.pending_capture)
+        set(state.save_button, 'Enable', 'on', 'BackgroundColor', [1 0.63 0.14], ...
+            'ForegroundColor', [0.1 0.08 0.04]);
+    else
+        set(state.save_button, 'Enable', 'off', 'BackgroundColor', [0.72 0.72 0.72], ...
+            'ForegroundColor', [0.35 0.35 0.35]);
+    end
+end
+
+function show_idle_status(state, message)
+    if ~isempty(state.pending_capture)
+        message = ['已停止 · ' state.pending_capture.modulation_config.name ' 本轮数据未保存'];
+        color = [1 0.7 0.25];
+    else
+        color = [0.35 0.95 0.45];
+    end
+    set(state.status, 'String', message, 'ForegroundColor', color);
 end
 
 function set_capture_controls(state, busy)
@@ -183,7 +279,7 @@ end
 
 function apply_ip(~, ~)
     state = guidata(fig);
-    if state.running || state.saving
+    if state.running || state.saving || state.stopping
         return;
     end
     requestedIP = strtrim(get(state.ip_edit, 'String'));
@@ -194,14 +290,13 @@ function apply_ip(~, ~)
     end
     state.active_ip = requestedIP;
     setpref('XilingZU27DR', 'BoardIP', requestedIP);
-    set(state.status, 'String', ['IP applied: ' requestedIP], ...
-        'ForegroundColor', [0.35 0.95 0.45]);
+    show_idle_status(state, ['IP applied: ' requestedIP]);
     guidata(fig, state);
 end
 
 function start_capture(~, ~)
     state = guidata(fig);
-    if state.running || state.saving
+    if state.running || state.saving || state.stopping
         return;
     end
     requestedIP = strtrim(get(state.ip_edit, 'String'));
@@ -217,13 +312,16 @@ function start_capture(~, ~)
     end
 
     state.packet_records = state.packet_records([]);
+    state.pending_capture = [];
+    state.last_output_folder = '';
     state.start_time = datetime('now', 'Format', 'yyyy-MM-dd HH:mm:ss.SSS');
     state.last_rx_count = NaN;
     state.last_crc_err_count = NaN;
     state.session_rx_delta = 0;
     state.session_crc_err_delta = 0;
-    clear_display(state, 'Waiting for packets ...');
+    clear_display(state);
     state.running = true;
+    update_save_button(state);
     set_capture_controls(state, true);
     set(state.stop_button, 'Enable', 'on');
     set(state.status, 'String', ['Opening UDP to ' state.active_ip ':5001 ...'], ...
@@ -352,16 +450,9 @@ function process_packet(~, packet, receivedAt)
     state.session_crc_err_delta = state.session_crc_err_delta + crcErrorDelta;
     state.last_rx_count = rxCount;
     state.last_crc_err_count = crcErrorCount;
-    if state.session_rx_delta > 0
-        per = min(1, max(0, state.session_crc_err_delta / state.session_rx_delta));
-    else
-        per = 0;
-    end
-    if per >= 1
-        berEstimate = 1;
-    else
-        berEstimate = 1 - (1 - per) .^ (1 / 108000);
-    end
+    [per, perUpper95] = calculate_per_statistics(state.session_rx_delta, state.session_crc_err_delta);
+    % Keep BER tied to observed PER; log1p/expm1 preserve small probabilities.
+    berEstimate = -expm1(log1p(-per) / 108000);
 
     packetNumber = numel(state.packet_records) + 1;
     elapsed = seconds(receivedAt - state.start_time);
@@ -371,7 +462,9 @@ function process_packet(~, packet, receivedAt)
         'pac_rx_cnt', rxCount, 'pac_rx_crc_ok_cnt', double(packet.pac_rx_crc_ok_cnt), ...
         'pac_rx_crc_err_cnt', crcErrorCount, 'rms', double(packet.rms), ...
         'evm_rms_percent', double(evmRms), 'mer_db', double(merDb), ...
-        'per', per, 'ber_estimate', berEstimate, 'i_raw', iRaw, 'q_raw', qRaw, ...
+        'per', per, 'per_upper_95', perUpper95, ...
+        'per_sample_count', state.session_rx_delta, 'per_error_count', state.session_crc_err_delta, ...
+        'ber_estimate', berEstimate, 'i_raw', iRaw, 'q_raw', qRaw, ...
         'i_normalized', iNormalized, 'q_normalized', qNormalized);
     state.packet_records(end + 1) = record;
 
@@ -379,7 +472,7 @@ function process_packet(~, packet, receivedAt)
     packetCount = numel(state.packet_records);
     recent = state.packet_records(max(1, packetCount - 49):packetCount);
     x = [recent.elapsed_seconds];
-    metricValues = {[recent.evm_rms_percent], [recent.per], ...
+    metricValues = {[recent.evm_rms_percent], [recent.per_upper_95], ...
         [recent.ber_estimate], [recent.mer_db], [recent.rms]};
     for plotIndex = 1:5
         set(state.metric_lines(plotIndex), 'XData', x, 'YData', metricValues{plotIndex});
@@ -389,12 +482,20 @@ function process_packet(~, packet, receivedAt)
             xlim(state.metric_axes(plotIndex), [x(1) x(end)]);
         end
     end
-    set(state.live_text, 'String', sprintf([ ...
-        '%s | Recorded packets: %d | I/Q points: %d | Tx: %.0f | Rx: %.0f | CRC OK: %.0f | CRC ERR: %.0f\n' ...
-        'EVM RMS: %.3f %% | MER: %.3f dB | PER: %.4e | BER estimate: %.4e | Rx IF Power: %.3f dB'], ...
-        state.modulation_config.name, packetCount, total_point_count(state.packet_records), ...
-        double(packet.pac_tx_cnt), rxCount, double(packet.pac_rx_crc_ok_cnt), ...
-        crcErrorCount, evmRms, merDb, per, berEstimate, double(packet.rms)));
+    values = {sprintf('%.3f %%', evmRms), format_probability(perUpper95), ...
+        format_probability(berEstimate), sprintf('%.3f dB', merDb), sprintf('%.3f dB', double(packet.rms))};
+    for index = 1:5
+        set(state.metric_values(index), 'String', values{index});
+    end
+    if isnan(per) && (state.session_rx_delta ~= 0 || state.session_crc_err_delta ~= 0)
+        detail = sprintf('计数异常  本轮错包/收包 %.0f/%.0f', ...
+            state.session_crc_err_delta, state.session_rx_delta);
+    else
+        detail = sprintf('观测 PER %s  本轮错包/收包 %.0f/%.0f', format_probability(per), ...
+            state.session_crc_err_delta, state.session_rx_delta);
+    end
+    set(state.per_details, 'String', detail);
+    update_summary(state, elapsed);
     guidata(fig, state);
     drawnow limitrate;
 end
@@ -408,33 +509,85 @@ function stop_capture(~, ~)
         return;
     end
     state.running = false;
-    state.saving = true;
+    state.stopping = true;
+    endTime = datetime('now', 'Format', 'yyyy-MM-dd HH:mm:ss.SSS');
     guidata(fig, state);
     stop_timer(state.request_timer);
     state.request_timer = [];
     close_client(state.client);
     state.client = [];
     set(state.stop_button, 'Enable', 'off');
-    set_capture_controls(state, true);
-    set(state.status, 'String', 'Saving capture ...', 'ForegroundColor', [1 0.7 0]);
+    update_summary(state, seconds(endTime - state.start_time));
+    if isempty(state.packet_records)
+        state.pending_capture = [];
+        set(state.status, 'String', '已停止 · 未收到有效数据', 'ForegroundColor', [1 0.7 0.25]);
+    else
+        state.pending_capture = struct('packet_records', state.packet_records, ...
+            'start_time', state.start_time, 'end_time', endTime, ...
+            'active_ip', state.active_ip, 'modulation_config', state.modulation_config, ...
+            'dashboard_image', []);
+        set(state.status, 'String', '已停止 · 本轮数据未保存', 'ForegroundColor', [1 0.7 0.25]);
+    end
+    % Callbacks remain guarded by stopping while print processes graphics events.
+    set_capture_controls(state, false);
+    update_save_button(state);
     guidata(fig, state);
+    if ~isempty(state.pending_capture)
+        try
+            set(fig, 'InvertHardcopy', 'off', 'PaperPositionMode', 'auto');
+            sync_modulation_buttons(state);
+            refresh(fig);
+            drawnow;
+            % R2023b caches native radio glyphs between hidden-window prints.
+            % Prime that cache so this snapshot uses the current selection.
+            print(fig, '-RGBImage', '-r150');
+            dashboardImage = print(fig, '-RGBImage', '-r150');
+            state = guidata(fig);
+            state.pending_capture.dashboard_image = dashboardImage;
+        catch ME
+            state = guidata(fig);
+            set(state.status, 'String', ['Stop image capture failed: ' ME.message], ...
+                'ForegroundColor', [1 0.3 0.25]);
+        end
+    end
+    state.stopping = false;
+    guidata(fig, state);
+end
+
+function save_capture(~, ~)
+    if ~ishandle(fig)
+        return;
+    end
+    state = guidata(fig);
+    if state.running || state.saving || state.stopping || isempty(state.pending_capture)
+        return;
+    end
+    capture = state.pending_capture;
+    state.saving = true;
+    set_capture_controls(state, true);
+    update_save_button(state);
+    guidata(fig, state);
+    set(state.status, 'String', 'Saving capture ...', 'ForegroundColor', [1 0.7 0]);
     try
+        if isempty(capture.dashboard_image)
+            error('WPR:MissingSnapshot', 'The stopped dashboard image is unavailable; capture data remains in memory.');
+        end
         outputFolder = create_record_folder(state.output_root);
         [packetMetrics, constellationPoints, packetRecords, metadata] = ...
-            build_record_tables(state.packet_records, state.start_time, ...
-            datetime('now', 'Format', 'yyyy-MM-dd HH:mm:ss.SSS'), ...
-            state.active_ip, state.modulation_config);
+            build_record_tables(capture.packet_records, capture.start_time, capture.end_time, ...
+            capture.active_ip, capture.modulation_config);
         save(fullfile(outputFolder, 'metrics_recording.mat'), ...
             'packetRecords', 'packetMetrics', 'constellationPoints', 'metadata', '-v7.3');
         writetable(packetMetrics, fullfile(outputFolder, 'packet_metrics.csv'));
         writetable(constellationPoints, fullfile(outputFolder, 'constellation_points.csv'));
-        % print includes the modulation controls and live values in the image.
-        set(fig, 'InvertHardcopy', 'off', 'PaperPositionMode', 'auto');
-        print(fig, fullfile(outputFolder, 'dashboard.png'), '-dpng', '-r150');
+        imwrite(capture.dashboard_image, fullfile(outputFolder, 'dashboard.png'));
         state = guidata(fig);
-        set(state.status, 'String', sprintf('Saved %d packets / %d points: %s', ...
-            height(packetMetrics), height(constellationPoints), outputFolder), ...
+        state.pending_capture = [];
+        state.last_output_folder = outputFolder;
+        set(state.status, 'String', sprintf('已保存 %d 包 / %d 个点', ...
+            height(packetMetrics), height(constellationPoints)), ...
             'ForegroundColor', [0.35 0.95 0.45]);
+        set(state.status, 'TooltipString', outputFolder);
         guidata(fig, state);
     catch ME
         state = guidata(fig);
@@ -445,20 +598,17 @@ function stop_capture(~, ~)
     state = guidata(fig);
     state.saving = false;
     set_capture_controls(state, false);
+    update_save_button(state);
     guidata(fig, state);
 end
 
 function close_gui(hObject, ~)
     state = guidata(fig);
-    if state.saving
+    if state.saving || state.stopping
         return;
     end
-    if state.running
-        stop_capture([], []);
-    else
-        stop_timer(state.request_timer);
-        close_client(state.client);
-    end
+    stop_timer(state.request_timer);
+    close_client(state.client);
     release(evmCalculator);
     release(merCalculator);
     if ishandle(hObject)
@@ -572,6 +722,33 @@ if delta < 0
 end
 end
 
+function [observed, upper95] = calculate_per_statistics(sampleCount, errorCount)
+% Exact one-sided, pointwise binomial bound, including nonzero error counts.
+observed = NaN;
+upper95 = NaN;
+if ~isfinite(sampleCount) || ~isfinite(errorCount) || sampleCount <= 0 || ...
+        errorCount < 0 || errorCount > sampleCount || ...
+        sampleCount ~= fix(sampleCount) || errorCount ~= fix(errorCount)
+    return;
+end
+observed = errorCount / sampleCount;
+if errorCount == 0
+    upper95 = -expm1(log(0.05) / sampleCount);
+elseif errorCount == sampleCount
+    upper95 = 1;
+else
+    upper95 = betaincinv(0.95, errorCount + 1, sampleCount - errorCount);
+end
+end
+
+function label = format_probability(value)
+if isfinite(value)
+    label = sprintf('%.4e', value);
+else
+    label = '--';
+end
+end
+
 function count = total_point_count(records)
 if isempty(records)
     count = 0;
@@ -596,6 +773,9 @@ if packetCount == 0
     evm_rms_percent = zeros(0, 1);
     mer_db = zeros(0, 1);
     per = zeros(0, 1);
+    per_upper_95 = zeros(0, 1);
+    per_sample_count = zeros(0, 1);
+    per_error_count = zeros(0, 1);
     ber_estimate = zeros(0, 1);
 else
     packet_number = [records.packet_number]';
@@ -609,11 +789,14 @@ else
     evm_rms_percent = [records.evm_rms_percent]';
     mer_db = [records.mer_db]';
     per = [records.per]';
+    per_upper_95 = [records.per_upper_95]';
+    per_sample_count = [records.per_sample_count]';
+    per_error_count = [records.per_error_count]';
     ber_estimate = [records.ber_estimate]';
 end
 packetMetrics = table(packet_number, receive_time, elapsed_seconds, pac_tx_cnt, ...
     pac_rx_cnt, pac_rx_crc_ok_cnt, pac_rx_crc_err_cnt, rms, evm_rms_percent, ...
-    mer_db, per, ber_estimate);
+    mer_db, per, per_upper_95, per_sample_count, per_error_count, ber_estimate);
 packetMetrics.modulation = repmat(string(modulationConfig.name), packetCount, 1);
 
 pointCount = total_point_count(records);
@@ -650,8 +833,13 @@ end
 metadata = struct('source_ip', deviceIP, 'source_port', 5001, ...
     'start_time', startTime, 'end_time', endTime, ...
     'duration_seconds', durationSeconds, 'packet_count', packetCount, ...
-    'point_count', pointCount, 'ber_type', 'PER-derived estimate', ...
+    'point_count', pointCount, 'ber_type', 'Observed-PER-derived estimate', ...
     'ber_packet_length_bits', 108000, ...
+    'per_confidence_level', 0.95, 'per_upper_method', 'One-sided Clopper-Pearson', ...
+    'per_confidence_scope', 'Pointwise at a fixed sample count; not a time-uniform confidence sequence.', ...
+    'per_model_assumptions', 'Independent packets with a constant error probability.', ...
+    'per_counter_basis', 'Cumulative pac_rx_crc_err_cnt/pac_rx_cnt deltas after the first report; not UDP report or I/Q point counts.', ...
+    'per_counter_basis_verified', false, ...
     'modulation', modulationConfig.name, 'modulation_order', modulationConfig.order, ...
     'reference_constellation', modulationConfig.reference_constellation, ...
     'reference_phase_offset_rad', modulationConfig.phase_offset_rad, ...
