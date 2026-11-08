@@ -34,6 +34,7 @@ initialState = struct('active_ip', deviceIP, 'running', false, 'saving', false, 
     'last_rx_count', NaN, 'last_crc_err_count', NaN, ...
     'session_rx_delta', 0, 'session_crc_err_delta', 0, ...
     'output_root', fullfile(fileparts(mfilename('fullpath')), 'constellation_records'), ...
+    'excel_row_limit', 1048575, ...
     'metric_lines', gobjects(5, 1), 'metric_axes', gobjects(5, 1), ...
     'metric_values', gobjects(5, 1), 'summary_values', gobjects(8, 1));
 [evmCalculator, merCalculator] = create_metric_calculators(modulationConfig.reference_constellation);
@@ -573,19 +574,24 @@ function save_capture(~, ~)
             error('WPR:MissingSnapshot', 'The stopped dashboard image is unavailable; capture data remains in memory.');
         end
         outputFolder = create_record_folder(state.output_root);
-        [packetMetrics, constellationPoints, packetRecords, metadata] = ...
+        [packetMetrics, constellationPoints, captureInfo] = ...
             build_record_tables(capture.packet_records, capture.start_time, capture.end_time, ...
             capture.active_ip, capture.modulation_config);
-        save(fullfile(outputFolder, 'metrics_recording.mat'), ...
-            'packetRecords', 'packetMetrics', 'constellationPoints', 'metadata', '-v7.3');
-        writetable(packetMetrics, fullfile(outputFolder, 'packet_metrics.csv'));
-        writetable(constellationPoints, fullfile(outputFolder, 'constellation_points.csv'));
+        workbookPath = fullfile(outputFolder, 'metrics_recording.xlsx');
+        rowLimit = min(1048575, state.excel_row_limit);
+        write_record_sheet(constellationPoints(1:min(height(constellationPoints), rowLimit), :), ...
+            workbookPath, '星座点');
+        write_record_sheet(packetMetrics(1:min(height(packetMetrics), rowLimit), :), ...
+            workbookPath, '逐包指标');
+        write_record_sheet(captureInfo, workbookPath, '采集信息');
+        write_overflow_sheets(constellationPoints, workbookPath, '星座点', rowLimit);
+        write_overflow_sheets(packetMetrics, workbookPath, '逐包指标', rowLimit);
         imwrite(capture.dashboard_image, fullfile(outputFolder, 'dashboard.png'));
         state = guidata(fig);
         state.pending_capture = [];
         state.last_output_folder = outputFolder;
         set(state.status, 'String', sprintf('已保存 %d 包 / %d 个点', ...
-            height(packetMetrics), height(constellationPoints)), ...
+            height(packetMetrics), total_point_count(capture.packet_records)), ...
             'ForegroundColor', [0.35 0.95 0.45]);
         set(state.status, 'TooltipString', outputFolder);
         guidata(fig, state);
@@ -757,96 +763,131 @@ else
 end
 end
 
-function [packetMetrics, constellationPoints, packetRecords, metadata] = ...
+function [packetMetrics, constellationPoints, captureInfo] = ...
         build_record_tables(records, startTime, endTime, deviceIP, modulationConfig)
-packetRecords = records;
 packetCount = numel(records);
-if packetCount == 0
-    packet_number = zeros(0, 1);
-    receive_time = NaT(0, 1, 'Format', 'yyyy-MM-dd HH:mm:ss.SSS');
-    elapsed_seconds = zeros(0, 1);
-    pac_tx_cnt = zeros(0, 1);
-    pac_rx_cnt = zeros(0, 1);
-    pac_rx_crc_ok_cnt = zeros(0, 1);
-    pac_rx_crc_err_cnt = zeros(0, 1);
-    rms = zeros(0, 1);
-    evm_rms_percent = zeros(0, 1);
-    mer_db = zeros(0, 1);
-    per = zeros(0, 1);
-    per_upper_95 = zeros(0, 1);
-    per_sample_count = zeros(0, 1);
-    per_error_count = zeros(0, 1);
-    ber_estimate = zeros(0, 1);
-else
-    packet_number = [records.packet_number]';
-    receive_time = [records.receive_time]';
-    elapsed_seconds = [records.elapsed_seconds]';
-    pac_tx_cnt = [records.pac_tx_cnt]';
-    pac_rx_cnt = [records.pac_rx_cnt]';
-    pac_rx_crc_ok_cnt = [records.pac_rx_crc_ok_cnt]';
-    pac_rx_crc_err_cnt = [records.pac_rx_crc_err_cnt]';
-    rms = [records.rms]';
-    evm_rms_percent = [records.evm_rms_percent]';
-    mer_db = [records.mer_db]';
-    per = [records.per]';
-    per_upper_95 = [records.per_upper_95]';
-    per_sample_count = [records.per_sample_count]';
-    per_error_count = [records.per_error_count]';
-    ber_estimate = [records.ber_estimate]';
-end
-packetMetrics = table(packet_number, receive_time, elapsed_seconds, pac_tx_cnt, ...
-    pac_rx_cnt, pac_rx_crc_ok_cnt, pac_rx_crc_err_cnt, rms, evm_rms_percent, ...
-    mer_db, per, per_upper_95, per_sample_count, per_error_count, ber_estimate);
-packetMetrics.modulation = repmat(string(modulationConfig.name), packetCount, 1);
+packet_number = [records.packet_number]';
+receive_time = format_record_times([records.receive_time]');
+evm_rms_percent = [records.evm_rms_percent]';
+mer_db = [records.mer_db]';
+rx_if_power = [records.rms]';
+per_upper_95 = [records.per_upper_95]';
+per_sample_count = [records.per_sample_count]';
+per_error_count = [records.per_error_count]';
+ber_estimate = [records.ber_estimate]';
+packetMetrics = table(packet_number, receive_time, evm_rms_percent, mer_db, ...
+    rx_if_power, per_upper_95, per_sample_count, per_error_count, ber_estimate);
 
-pointCount = total_point_count(records);
-point_packet_number = zeros(pointCount, 1);
-point_number = zeros(pointCount, 1);
-point_receive_time = NaT(pointCount, 1, 'Format', 'yyyy-MM-dd HH:mm:ss.SSS');
-i_raw = zeros(pointCount, 1);
-q_raw = zeros(pointCount, 1);
-i_normalized = zeros(pointCount, 1);
-q_normalized = zeros(pointCount, 1);
-offset = 0;
+point_count = zeros(packetCount, 1);
+i_raw_array = strings(packetCount, 1);
+q_raw_array = strings(packetCount, 1);
 for k = 1:packetCount
     pointLength = numel(records(k).i_raw);
-    target = offset + (1:pointLength);
-    point_packet_number(target) = records(k).packet_number;
-    point_number(target) = (1:pointLength)';
-    point_receive_time(target) = records(k).receive_time;
-    i_raw(target) = records(k).i_raw;
-    q_raw(target) = records(k).q_raw;
-    i_normalized(target) = records(k).i_normalized;
-    q_normalized(target) = records(k).q_normalized;
-    offset = offset + pointLength;
+    point_count(k) = pointLength;
+    i_raw_array(k) = encode_point_array(records(k).i_raw);
+    q_raw_array(k) = encode_point_array(records(k).q_raw);
 end
-constellationPoints = table(point_packet_number, point_number, point_receive_time, ...
-    i_raw, q_raw, i_normalized, q_normalized, 'VariableNames', ...
-    {'packet_number', 'point_number', 'receive_time', 'i_raw', 'q_raw', ...
-    'i_normalized', 'q_normalized'});
-constellationPoints.modulation = repmat(string(modulationConfig.name), pointCount, 1);
-if ~isempty(startTime) && ~isnat(startTime) && ~isempty(endTime) && ~isnat(endTime)
-    durationSeconds = max(0, seconds(endTime - startTime));
-else
-    durationSeconds = 0;
-end
+constellationPoints = table(packet_number, receive_time, point_count, i_raw_array, ...
+    q_raw_array, 'VariableNames', ...
+    {'packet_number', 'receive_time', 'point_count', 'i_raw_array', 'q_raw_array'});
+
 metadata = struct('source_ip', deviceIP, 'source_port', 5001, ...
     'start_time', startTime, 'end_time', endTime, ...
-    'duration_seconds', durationSeconds, 'packet_count', packetCount, ...
-    'point_count', pointCount, 'ber_type', 'Observed-PER-derived estimate', ...
-    'ber_packet_length_bits', 108000, ...
+    'ber_type', 'Observed-PER-derived estimate', 'ber_packet_length_bits', 108000, ...
+    'ber_model_assumptions', 'Independent equally likely bit errors; any bit error causes a packet error.', ...
     'per_confidence_level', 0.95, 'per_upper_method', 'One-sided Clopper-Pearson', ...
     'per_confidence_scope', 'Pointwise at a fixed sample count; not a time-uniform confidence sequence.', ...
     'per_model_assumptions', 'Independent packets with a constant error probability.', ...
     'per_counter_basis', 'Cumulative pac_rx_crc_err_cnt/pac_rx_cnt deltas after the first report; not UDP report or I/Q point counts.', ...
     'per_counter_basis_verified', false, ...
-    'modulation', modulationConfig.name, 'modulation_order', modulationConfig.order, ...
+    'modulation', modulationConfig.name, ...
     'reference_constellation', modulationConfig.reference_constellation, ...
     'reference_phase_offset_rad', modulationConfig.phase_offset_rad, ...
     'normalization_divisor', modulationConfig.normalization_divisor, ...
     'normalization_definition', '(i_raw + 1i*q_raw) / normalization_divisor; no gain or phase fitting.', ...
     'board_modulation_controlled', false, ...
+    'rx_if_power_definition', 'Board-provided rms; not calibrated RSSI.', ...
+    'excel_value_encoding', 'Blank cells represent unavailable (NaN) values; text Inf and -Inf preserve signed infinity.', ...
+    'point_table_encoding', 'One row per UDP report; i_raw_array and q_raw_array are JSON numeric arrays; array index is the point number; point timestamp is shared within the row.', ...
     'receive_time_definition', 'Computer UDP callback time; points in a packet share the time.');
+metadataFields = {'source_ip'; 'source_port'; 'modulation'; 'start_time'; 'end_time'; ...
+    'reference_constellation'; 'reference_phase_offset_rad'; 'normalization_divisor'; ...
+    'normalization_definition'; 'per_confidence_level'; 'per_upper_method'; ...
+    'per_confidence_scope'; 'per_model_assumptions'; 'per_counter_basis'; ...
+    'per_counter_basis_verified'; 'ber_type'; 'ber_packet_length_bits'; 'ber_model_assumptions'; ...
+    'board_modulation_controlled'; 'rx_if_power_definition'; 'excel_value_encoding'; ...
+    'point_table_encoding'; 'receive_time_definition'};
+metadataValues = {char(string(metadata.source_ip)); sprintf('%d', metadata.source_port); ...
+    metadata.modulation; format_record_time(metadata.start_time); format_record_time(metadata.end_time); ...
+    mat2str(metadata.reference_constellation, 15); ...
+    sprintf('%.15g', metadata.reference_phase_offset_rad); ...
+    sprintf('%.15g', metadata.normalization_divisor); metadata.normalization_definition; ...
+    sprintf('%.15g', metadata.per_confidence_level); metadata.per_upper_method; ...
+    metadata.per_confidence_scope; metadata.per_model_assumptions; metadata.per_counter_basis; ...
+    logical_text(metadata.per_counter_basis_verified); metadata.ber_type; ...
+    sprintf('%d', metadata.ber_packet_length_bits); metadata.ber_model_assumptions; ...
+    logical_text(metadata.board_modulation_controlled); metadata.rx_if_power_definition; ...
+    metadata.excel_value_encoding; metadata.point_table_encoding; metadata.receive_time_definition};
+captureInfo = table(string(metadataFields), string(metadataValues), ...
+    'VariableNames', {'field', 'value'});
+end
+
+function encoded = encode_point_array(values)
+encoded = string(jsonencode(double(values(:).')));
+if strlength(encoded) > 32767
+    error('WPR:PointArrayTooLong', ...
+        'A JSON point array exceeds the Excel cell limit of 32767 characters.');
+end
+end
+
+function write_overflow_sheets(data, workbookPath, baseName, rowLimit)
+for startRow = rowLimit + 1:rowLimit:height(data)
+    sheetIndex = floor((startRow - 1) / rowLimit) + 1;
+    rows = startRow:min(startRow + rowLimit - 1, height(data));
+    write_record_sheet(data(rows, :), workbookPath, sprintf('%s_%d', baseName, sheetIndex));
+end
+end
+
+function write_record_sheet(data, workbookPath, sheetName)
+% R2023b otherwise exports either sign of Inf as the finite number 65535.
+for column = data.Properties.VariableNames
+    values = data.(column{1});
+    if isnumeric(values) && any(isinf(values(:)))
+        cells = num2cell(values);
+        for index = reshape(find(isinf(values)), 1, [])
+            cells{index} = sprintf('%g', values(index));
+        end
+        data.(column{1}) = cells;
+    end
+end
+writetable(data, workbookPath, 'Sheet', sheetName, 'UseExcel', false);
+end
+
+function formatted = format_record_times(times)
+times = times(:);
+if isempty(times)
+    formatted = strings(0, 1);
+    return;
+end
+times.Format = 'yyyy-MM-dd HH:mm:ss.SSS';
+formatted = string(times);
+end
+
+function formatted = format_record_time(timeValue)
+if isempty(timeValue) || isnat(timeValue)
+    formatted = '';
+    return;
+end
+timeValue.Format = 'yyyy-MM-dd HH:mm:ss.SSS';
+formatted = char(string(timeValue));
+end
+
+function value = logical_text(flag)
+if flag
+    value = 'true';
+else
+    value = 'false';
+end
 end
 
 function outputFolder = create_record_folder(outputRoot)

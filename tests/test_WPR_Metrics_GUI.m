@@ -13,7 +13,7 @@ testCase.TestData.hadIP = ispref('XilingZU27DR', 'BoardIP');
 if testCase.TestData.hadIP
     testCase.TestData.originalIP = getpref('XilingZU27DR', 'BoardIP');
 end
-runRoot = fullfile(repo, '过程文件', 'PER置信上限离线验收', ...
+runRoot = fullfile(repo, '过程文件', '精简工作簿离线验收', ...
     char(datetime('now', 'Format', 'yyyyMMdd_HHmmss_SSS')));
 mkdir(runRoot);
 testCase.TestData.runRoot = runRoot;
@@ -456,9 +456,12 @@ testCase.verifyEqual(state.pending_capture, capture);
 invoke(state.save_button);
 state = guidata(fig);
 verify_saved(testCase, state.last_output_folder, capture);
-data = load(fullfile(state.last_output_folder, 'metrics_recording.mat'));
-testCase.verifyEqual(data.metadata.source_ip, '127.0.0.1');
-testCase.verifyLessThan(data.metadata.end_time, datetime('now') - seconds(0.04));
+metadata = readtable(fullfile(state.last_output_folder, 'metrics_recording.xlsx'), ...
+    'Sheet', '采集信息', 'TextType', 'string');
+testCase.verifyEqual(metadata_value(metadata, 'source_ip'), "127.0.0.1");
+savedEndTime = datetime(metadata_value(metadata, 'end_time'), ...
+    'InputFormat', 'yyyy-MM-dd HH:mm:ss.SSS');
+testCase.verifyLessThan(savedEndTime, datetime('now') - seconds(0.04));
 end
 
 function testImageWriteFailureRetainsCaptureForRetry(testCase)
@@ -491,6 +494,48 @@ invoke(state.save_button);
 state = guidata(fig);
 verify_saved(testCase, state.last_output_folder, capture);
 testCase.verifyEmpty(state.pending_capture);
+end
+
+function testWorkbookOverflowKeepsAllRowsAndSheetOrder(testCase)
+fig = testCase.TestData.fig;
+state = guidata(fig);
+state.excel_row_limit = 3; % Exercise real continuation-sheet writes with a small capture.
+guidata(fig, state);
+start_local(fig);
+state = guidata(fig);
+reference = expected_reference('QPSK') * 1.05;
+for n = 1:5
+    state.process_packet(make_packet(reference, 100 + n * 10, n), ...
+        state.start_time + milliseconds(n));
+end
+state.stop_capture();
+state = guidata(fig);
+capture = state.pending_capture;
+invoke(state.save_button);
+state = guidata(fig);
+verify_saved(testCase, state.last_output_folder, capture, 3);
+end
+
+function testWorkbookPreservesUnavailableAndInfiniteMetrics(testCase)
+fig = testCase.TestData.fig;
+start_local(fig);
+state = guidata(fig);
+for n = 1:3
+    state.process_packet(make_packet(expected_reference('QPSK') * 1.05, 100 + n * 10, 0), ...
+        state.start_time + milliseconds(n));
+end
+state = guidata(fig);
+% Serialization edge cases: Excel has no native IEEE NaN/Inf cells.
+state.packet_records(1).mer_db = Inf;
+state.packet_records(2).mer_db = -Inf;
+state.packet_records(3).mer_db = NaN;
+guidata(fig, state);
+state.stop_capture();
+state = guidata(fig);
+capture = state.pending_capture;
+invoke(state.save_button);
+state = guidata(fig);
+verify_saved(testCase, state.last_output_folder, capture);
 end
 
 function testMetricLabelsSummaryAndLayout(testCase)
@@ -659,65 +704,133 @@ testCase.verifyEqual(get(state.save_button, 'BackgroundColor'), [1 0.63 0.14]);
 testCase.verifySubstring(get(state.status, 'String'), '未保存');
 end
 
-function verify_saved(testCase, folder, capture)
+function verify_saved(testCase, folder, capture, rowLimit)
+if nargin < 4
+    rowLimit = 1048575;
+end
 currentState = guidata(testCase.TestData.fig);
 testCase.assertTrue(isfolder(folder), get(currentState.status, 'String'));
 name = capture.modulation_config.name;
-data = load(fullfile(folder, 'metrics_recording.mat'));
-testCase.verifyEqual(data.metadata.start_time, capture.start_time);
-testCase.verifyEqual(data.metadata.end_time, capture.end_time);
-testCase.verifyEqual(data.metadata.duration_seconds, seconds(capture.end_time - capture.start_time));
-testCase.verifyEqual(data.metadata.source_ip, capture.active_ip);
-testCase.verifyEqual(data.metadata.modulation, name);
-testCase.verifyEqual(data.metadata.modulation_order, numel(expected_reference(name)));
-testCase.verifyEqual(data.metadata.reference_constellation, capture.modulation_config.reference_constellation);
-testCase.verifyEqual(data.metadata.normalization_divisor, 150 * sqrt(2));
+workbook = fullfile(folder, 'metrics_recording.xlsx');
+testCase.verifyTrue(isfile(workbook));
+actualSheets = string(sheetnames(workbook));
+pointSheets = continuation_sheet_names('星座点', numel(capture.packet_records), rowLimit);
+metricSheets = continuation_sheet_names('逐包指标', numel(capture.packet_records), rowLimit);
+testCase.verifyEqual(actualSheets(:), ...
+    [pointSheets(1); metricSheets(1); "采集信息"; ...
+    reshape(pointSheets(2:end), [], 1); reshape(metricSheets(2:end), [], 1)]);
+points = read_capture_sheets(testCase, workbook, pointSheets, rowLimit, 'points');
+metrics = read_capture_sheets(testCase, workbook, metricSheets, rowLimit, 'metrics');
+metadata = readtable(workbook, 'Sheet', '采集信息', 'TextType', 'string');
+testCase.verifyEqual(points.Properties.VariableNames, ...
+    {'packet_number', 'receive_time', 'point_count', 'i_raw_array', 'q_raw_array'});
+testCase.verifyEqual(metrics.Properties.VariableNames, ...
+    {'packet_number', 'receive_time', 'evm_rms_percent', 'mer_db', 'rx_if_power', ...
+    'per_upper_95', 'per_sample_count', 'per_error_count', 'ber_estimate'});
+testCase.verifyEqual(metadata.Properties.VariableNames, {'field', 'value'});
+testCase.verifyEqual(metadata_value(metadata, 'start_time'), format_test_time(capture.start_time));
+testCase.verifyEqual(metadata_value(metadata, 'end_time'), format_test_time(capture.end_time));
+testCase.verifyEqual(metadata_value(metadata, 'source_ip'), string(capture.active_ip));
+testCase.verifyEqual(metadata_value(metadata, 'source_port'), "5001");
+testCase.verifyEqual(metadata_value(metadata, 'modulation'), string(name));
+testCase.verifyEqual(metadata_value(metadata, 'reference_constellation'), ...
+    string(mat2str(capture.modulation_config.reference_constellation, 15)));
+testCase.verifyEqual(metadata_value(metadata, 'normalization_divisor'), ...
+    string(sprintf('%.15g', 150 * sqrt(2))));
+testCase.verifyEqual(metadata_value(metadata, 'per_confidence_level'), "0.95");
+testCase.verifyEqual(metadata_value(metadata, 'per_upper_method'), "One-sided Clopper-Pearson");
+testCase.verifyEqual(metadata_value(metadata, 'per_counter_basis_verified'), "false");
+testCase.verifySubstring(metadata_value(metadata, 'per_confidence_scope'), 'Pointwise');
+testCase.verifySubstring(metadata_value(metadata, 'ber_type'), 'Observed-PER');
+testCase.verifyEqual(metadata_value(metadata, 'ber_packet_length_bits'), "108000");
+testCase.verifySubstring(metadata_value(metadata, 'receive_time_definition'), 'Computer UDP callback');
+testCase.verifySubstring(metadata_value(metadata, 'rx_if_power_definition'), 'not calibrated RSSI');
+testCase.verifySubstring(metadata_value(metadata, 'excel_value_encoding'), 'NaN');
+testCase.verifySubstring(metadata_value(metadata, 'point_table_encoding'), 'JSON numeric arrays');
 if strcmp(name, '8PSK')
-    testCase.verifyEqual(data.metadata.reference_phase_offset_rad, pi / 8);
+    testCase.verifyEqual(metadata_value(metadata, 'reference_phase_offset_rad'), ...
+        string(sprintf('%.15g', pi / 8)));
 end
-testCase.verifyFalse(data.metadata.board_modulation_controlled);
-testCase.verifyEqual(data.metadata.per_confidence_level, 0.95);
-testCase.verifyEqual(data.metadata.per_upper_method, 'One-sided Clopper-Pearson');
-testCase.verifyFalse(data.metadata.per_counter_basis_verified);
-testCase.verifySubstring(data.metadata.per_confidence_scope, 'Pointwise');
-testCase.verifySubstring(data.metadata.ber_type, 'Observed-PER');
-testCase.verifyEqual(data.metadata.packet_count, numel(capture.packet_records));
-testCase.verifyEqual(data.packetRecords, capture.packet_records);
-testCase.verifyEqual(data.packetMetrics.per_upper_95, [capture.packet_records.per_upper_95]');
-testCase.verifyEqual(data.packetMetrics.per_sample_count, [capture.packet_records.per_sample_count]');
-testCase.verifyEqual(data.packetMetrics.per_error_count, [capture.packet_records.per_error_count]');
-testCase.verifyEqual(data.packetMetrics.modulation, repmat(string(name), height(data.packetMetrics), 1));
-testCase.verifyEqual(data.constellationPoints.modulation, repmat(string(name), height(data.constellationPoints), 1));
+testCase.verifyEqual(metadata_value(metadata, 'board_modulation_controlled'), "false");
 testCase.verifyTrue(isfile(fullfile(folder, 'dashboard.png')));
 testCase.verifyEqual(imread(fullfile(folder, 'dashboard.png')), capture.dashboard_image);
 files = capture_inventory(folder);
-testCase.verifyNumElements(files(~[files.isdir]), 4);
-metrics = readtable(fullfile(folder, 'packet_metrics.csv'), 'TextType', 'string');
-points = readtable(fullfile(folder, 'constellation_points.csv'), 'TextType', 'string');
-testCase.verifyEqual(height(metrics), height(data.packetMetrics));
-testCase.verifyEqual(height(points), height(data.constellationPoints));
-testCase.verifyTrue(ismember('modulation', metrics.Properties.VariableNames));
-testCase.verifyTrue(ismember('modulation', points.Properties.VariableNames));
-numericColumns = setdiff(data.packetMetrics.Properties.VariableNames, {'receive_time', 'modulation'});
-for column = numericColumns
-    testCase.verifyEqual(metrics.(column{1}), data.packetMetrics.(column{1}), 'AbsTol', 1e-10);
+testCase.verifyNumElements(files(~[files.isdir]), 2);
+records = capture.packet_records;
+expectedTimes = format_test_times([records.receive_time]');
+testCase.verifyEqual(metrics.packet_number, [records.packet_number]');
+testCase.verifyEqual(metrics.receive_time, expectedTimes);
+testCase.verifyEqual(metrics.evm_rms_percent, [records.evm_rms_percent]', 'AbsTol', 1e-10);
+testCase.verifyEqual(metrics.mer_db, [records.mer_db]', 'AbsTol', 1e-10);
+testCase.verifyEqual(metrics.rx_if_power, [records.rms]', 'AbsTol', 1e-10);
+testCase.verifyEqual(metrics.per_upper_95, [records.per_upper_95]', 'AbsTol', 1e-10);
+testCase.verifyEqual(metrics.per_sample_count, [records.per_sample_count]');
+testCase.verifyEqual(metrics.per_error_count, [records.per_error_count]');
+testCase.verifyEqual(metrics.ber_estimate, [records.ber_estimate]', 'AbsTol', 1e-10);
+testCase.verifyFalse(ismember('per', metrics.Properties.VariableNames));
+testCase.verifyFalse(ismember('pac_rx_cnt', metrics.Properties.VariableNames));
+
+testCase.verifyEqual(points.packet_number, [records.packet_number]');
+testCase.verifyEqual(points.receive_time, expectedTimes);
+testCase.verifyEqual(points.point_count, arrayfun(@(record) numel(record.i_raw), records)');
+for k = 1:numel(records)
+    savedI = jsondecode(char(points.i_raw_array(k)));
+    savedQ = jsondecode(char(points.q_raw_array(k)));
+    testCase.verifyEqual(savedI(:), records(k).i_raw, 'AbsTol', 1e-10);
+    testCase.verifyEqual(savedQ(:), records(k).q_raw, 'AbsTol', 1e-10);
 end
-metricTimes = datetime(metrics.receive_time, 'InputFormat', 'yyyy-MM-dd HH:mm:ss.SSS');
-testCase.verifyLessThanOrEqual(max(abs(seconds(metricTimes - data.packetMetrics.receive_time))), 0.001);
-if ~isempty(points)
-    testCase.verifyEqual(string(metrics.modulation), repmat(string(name), height(metrics), 1));
-    testCase.verifyEqual(string(points.modulation), repmat(string(name), height(points), 1));
-    testCase.verifyEqual(points.i_raw, data.constellationPoints.i_raw, 'AbsTol', 1e-10);
-    testCase.verifyEqual(points.q_raw, data.constellationPoints.q_raw, 'AbsTol', 1e-10);
-    testCase.verifyEqual(points.i_normalized, data.constellationPoints.i_normalized, 'AbsTol', 1e-12);
-    testCase.verifyEqual(points.q_normalized, data.constellationPoints.q_normalized, 'AbsTol', 1e-12);
-    for k = 1:numel(capture.packet_records)
-        selected = points.packet_number == k;
-        csvTime = datetime(points.receive_time(selected), 'InputFormat', 'yyyy-MM-dd HH:mm:ss.SSS');
-        delta = abs(seconds(csvTime - capture.packet_records(k).receive_time));
-        testCase.verifyLessThanOrEqual(max(delta), 0.001);
+end
+
+function names = continuation_sheet_names(baseName, rowCount, rowLimit)
+names = string(baseName);
+for k = 2:ceil(rowCount / rowLimit)
+    names(end + 1, 1) = sprintf('%s_%d', baseName, k); %#ok<AGROW>
+end
+end
+
+function data = read_capture_sheets(testCase, workbook, names, rowLimit, kind)
+data = table;
+for k = 1:numel(names)
+    options = detectImportOptions(workbook, 'Sheet', names(k), 'TextType', 'string');
+    if strcmp(kind, 'points')
+        numericColumns = {'packet_number', 'point_count'};
+        textColumns = {'receive_time', 'i_raw_array', 'q_raw_array'};
+    else
+        numericColumns = setdiff(options.VariableNames, {'receive_time'});
+        textColumns = {'receive_time'};
     end
+    options = setvartype(options, numericColumns, 'double');
+    options = setvartype(options, textColumns, 'string');
+    part = readtable(workbook, options);
+    testCase.verifyLessThanOrEqual(height(part), rowLimit);
+    if k < numel(names)
+        testCase.verifyEqual(height(part), rowLimit);
+    end
+    data = [data; part]; %#ok<AGROW>
 end
+end
+
+function value = metadata_value(metadata, field)
+selected = metadata.field == string(field);
+if nnz(selected) ~= 1
+    error('WPR:MissingMetadataField', 'Expected one metadata row for %s.', field);
+end
+value = metadata.value(selected);
+end
+
+function formatted = format_test_time(timeValue)
+formatted = format_test_times(timeValue);
+formatted = formatted(1);
+end
+
+function formatted = format_test_times(times)
+times = times(:);
+times.Format = 'yyyy-MM-dd HH:mm:ss.SSS';
+formatted = string(times);
+end
+
+function count = total_capture_points(records)
+count = sum(arrayfun(@(record) numel(record.i_raw), records));
 end
 
 function verify_snapshot_selection(testCase, fig, capture)
