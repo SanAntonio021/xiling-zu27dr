@@ -83,6 +83,7 @@ for k = 1:numel(names)
     start_local(fig);
     state = guidata(fig);
     reference = repmat(expected_reference(names{k}), 8, 1);
+    state.process_packet(make_packet(reference, 100, 4), state.start_time);
     for n = 1:numel(factors)
         packet = make_packet(reference * factors(n), 100 + n * 10, 4 + n);
         receivedAt = state.start_time + seconds(n * 0.001);
@@ -92,16 +93,13 @@ for k = 1:numel(names)
         if n == 1
             testCase.verifyLessThan(recorded.evm_rms_percent, 1e-10);
             testCase.verifyGreaterThan(recorded.mer_db, 250);
-            testCase.verifyTrue(isnan(recorded.per));
-            testCase.verifyTrue(isnan(recorded.per_upper_95));
-            testCase.verifyTrue(isnan(recorded.ber_estimate));
-            testCase.verifyTrue(isnan(recorded.ber_upper_95));
         else
             errorMagnitude = abs(factors(n) - 1);
             testCase.verifyEqual(recorded.evm_rms_percent, 100 * errorMagnitude, 'AbsTol', 1e-9);
             testCase.verifyEqual(recorded.mer_db, -20 * log10(errorMagnitude), 'AbsTol', 1e-9);
-            testCase.verifyEqual(recorded.per, 0.1, 'AbsTol', 1e-14);
         end
+        testCase.verifyEqual(recorded.per, 0.1, 'AbsTol', 1e-14);
+        testCase.verifyEqual(recorded.rx_packet_increment, 10);
         testCase.verifyEqual(recorded.receive_time, receivedAt);
         testCase.verifyEqual(recorded.i_raw, packet.ret_iq_array(:, 1));
         testCase.verifyEqual(recorded.q_raw, packet.ret_iq_array(:, 2));
@@ -135,7 +133,8 @@ for k = 1:numel(names)
         testCase.verifyTrue(all(isnan(get(line, 'YData'))));
     end
     testCase.verifyEqual(get(cleared.metric_values(1), 'String'), '--');
-    testCase.verifyEqual(get(cleared.summary_values(1), 'String'), 'UDP 0包');
+    testCase.verifyEqual(get(cleared.summary_values(1), 'String'), ...
+        {'数据更新：0 次'; '本次新增：--'});
     testCase.verifyEqual(get(cleared.summary_values(4), 'String'), '板卡累计');
 end
 end
@@ -155,6 +154,7 @@ testCase.verifyEqual(get(state.modulation_group.SelectedObject, 'Tag'), '16QAM')
 originalStart = state.start_time;
 invoke(state.start_button);
 testCase.verifyEqual(guidata(fig).start_time, originalStart);
+state.process_packet(make_packet(expected_reference('16QAM'), 99, 3), originalStart);
 state.process_packet(make_packet(expected_reference('16QAM'), 100, 3), originalStart);
 state.stop_capture();
 state = guidata(fig);
@@ -196,26 +196,39 @@ for cycle = 1:2
     start_local(fig);
     state = guidata(fig);
     testCase.verifyEmpty(state.packet_records);
+    testCase.verifyEmpty(state.counter_baseline);
     testCase.verifyEmpty(state.pending_capture);
     testCase.verifyEqual(get(state.save_button, 'Enable'), 'off');
     testCase.verifyTrue(all(isnan(get(state.metric_lines(1), 'YData'))));
     reference = repmat(expected_reference('8PSK'), cycle, 1);
     state.process_packet(make_packet(reference * (1 + 0.02 * cycle), 1000 * cycle, 100), state.start_time);
     state = guidata(fig);
+    testCase.verifyEmpty(state.packet_records);
+    testCase.verifyEqual(state.counter_baseline.pac_rx_cnt, 1000 * cycle);
+    testCase.verifyEqual(state.counter_baseline.pac_rx_crc_err_cnt, 100);
+    testCase.verifyEqual(get(state.summary_values(1), 'String'), ...
+        {'数据更新：0 次'; '本次新增：--'});
+    state.process_packet(make_packet(reference * (1 + 0.02 * cycle), ...
+        1000 * cycle + 10, 100 + cycle), state.start_time + milliseconds(1));
+    state = guidata(fig);
     testCase.verifyEqual(state.packet_records(1).packet_number, 1);
-    testCase.verifyTrue(isnan(state.packet_records(1).per));
-    testCase.verifyTrue(isnan(state.packet_records(1).per_upper_95));
-    testCase.verifyTrue(isnan(state.packet_records(1).ber_upper_95));
-    testCase.verifyEqual(state.packet_records(1).per_sample_count, 0);
-    testCase.verifyEqual(state.packet_records(1).per_error_count, 0);
-    testCase.verifyEqual(get(state.metric_values(2), 'String'), '--');
+    testCase.verifyEqual(state.packet_records(1).per, cycle / 10, 'AbsTol', 1e-14);
+    testCase.verifyTrue(isfinite(state.packet_records(1).per_upper_95));
+    testCase.verifyTrue(isfinite(state.packet_records(1).ber_upper_95));
+    testCase.verifyEqual(state.packet_records(1).per_sample_count, 10);
+    testCase.verifyEqual(state.packet_records(1).per_error_count, cycle);
+    testCase.verifyEqual(state.packet_records(1).rx_packet_increment, 10);
+    testCase.verifyEqual(get(state.summary_values(1), 'String'), ...
+        {'数据更新：1 次'; '本次新增：10 包'});
     testCase.verifyEqual(state.packet_records(1).evm_rms_percent, 2 * cycle, 'AbsTol', 1e-10);
-    state.process_packet(make_packet(reference, 1000 * cycle + 10, 100 + cycle), ...
-        state.start_time + milliseconds(1));
+    state.process_packet(make_packet(reference, 1000 * cycle + 20, 100 + 2 * cycle), ...
+        state.start_time + milliseconds(2));
     state = guidata(fig);
     testCase.verifyEqual(state.packet_records(2).per, cycle / 10, 'AbsTol', 1e-14);
-    testCase.verifyEqual(state.packet_records(2).per_sample_count, 10);
-    testCase.verifyEqual(state.packet_records(2).per_error_count, cycle);
+    testCase.verifyEqual(state.packet_records(2).per_sample_count, 20);
+    testCase.verifyEqual(state.packet_records(2).per_error_count, 2 * cycle);
+    testCase.verifyEqual(get(state.summary_values(1), 'String'), ...
+        {'数据更新：2 次'; '本次新增：10 包'});
     state.stop_capture();
     verify_unsaved(testCase, guidata(fig));
 end
@@ -228,7 +241,7 @@ state = guidata(fig);
 reference = expected_reference('QPSK');
 state.process_packet(make_packet(reference, 100, 7), state.start_time);
 state = guidata(fig);
-testCase.verifyTrue(isnan(state.packet_records(end).per_upper_95));
+testCase.verifyEmpty(state.packet_records);
 testCase.verifyEqual(get(state.metric_values(2), 'String'), '--');
 testCase.verifyEqual(get(state.metric_values(3), 'String'), '--');
 testCase.verifyEqual(get(state.per_details, 'String'), '本轮错包/收包 0/0');
@@ -263,6 +276,8 @@ state = guidata(fig);
 testCase.verifyEqual(state.packet_records(end).per_upper_95, previous.per_upper_95);
 testCase.verifyEqual(state.packet_records(end).per_sample_count, previous.per_sample_count);
 testCase.verifyNotEqual(state.packet_records(end).elapsed_seconds, previous.elapsed_seconds);
+testCase.verifyEqual(get(state.summary_values(1), 'String'), ...
+    {'数据更新：6 次'; '本次新增：0 包'});
 % No STOP snapshot is needed here; normal teardown exercises close without saving.
 end
 
@@ -334,6 +349,7 @@ fig = testCase.TestData.fig;
 start_local(fig);
 state = guidata(fig);
 reference = expected_reference('QPSK');
+state.process_packet(make_packet(reference, 0, 0), state.start_time);
 for n = 1:60
     state.process_packet(make_packet(reference, n * 10, 0), state.start_time + seconds(n));
 end
@@ -407,6 +423,7 @@ fig = testCase.TestData.fig;
 select_mode(fig, '16QAM');
 start_local(fig);
 state = guidata(fig);
+state.process_packet(make_packet(expected_reference('16QAM'), 99, 0), state.start_time);
 state.process_packet(make_packet(expected_reference('16QAM'), 100, 0), state.start_time);
 state = guidata(fig);
 blockedRoot = fullfile(testCase.TestData.runRoot, 'output_root_is_a_file');
@@ -437,6 +454,7 @@ function testCloseDuringCaptureDoesNotSaveAndCleansUp(testCase)
 fig = testCase.TestData.fig;
 start_local(fig);
 state = guidata(fig);
+state.process_packet(make_packet(expected_reference('QPSK'), 99, 0), state.start_time);
 state.process_packet(make_packet(expected_reference('QPSK'), 100, 0), state.start_time);
 client = state.client;
 requestTimer = state.request_timer;
@@ -451,6 +469,7 @@ function testCloseWithPendingDataDoesNotSave(testCase)
 fig = testCase.TestData.fig;
 start_local(fig);
 state = guidata(fig);
+state.process_packet(make_packet(expected_reference('QPSK'), 99, 0), state.start_time);
 state.process_packet(make_packet(expected_reference('QPSK'), 100, 0), state.start_time);
 state.stop_capture();
 state = guidata(fig);
@@ -465,6 +484,7 @@ fig = testCase.TestData.fig;
 select_mode(fig, '16QAM');
 start_local(fig);
 state = guidata(fig);
+state.process_packet(make_packet(expected_reference('16QAM'), 99, 2), state.start_time);
 state.process_packet(make_packet(expected_reference('16QAM') * 1.05, 100, 2), state.start_time);
 state.stop_capture();
 state = guidata(fig);
@@ -501,6 +521,7 @@ function testImageWriteFailureRetainsCaptureForRetry(testCase)
 fig = testCase.TestData.fig;
 start_local(fig);
 state = guidata(fig);
+state.process_packet(make_packet(expected_reference('QPSK'), 99, 0), state.start_time);
 state.process_packet(make_packet(expected_reference('QPSK'), 100, 0), state.start_time);
 state.stop_capture();
 state = guidata(fig);
@@ -534,6 +555,7 @@ fig = testCase.TestData.fig;
 start_local(fig);
 state = guidata(fig);
 reference = expected_reference('QPSK') * 1.05;
+state.process_packet(make_packet(reference, 100, 0), state.start_time);
 % Include a report larger than the former Excel JSON cell limit.
 pointCounts = [4 17 9000 1 33];
 for n = 1:numel(pointCounts)
@@ -553,6 +575,7 @@ function testMatPreservesUnavailableAndInfiniteMetrics(testCase)
 fig = testCase.TestData.fig;
 start_local(fig);
 state = guidata(fig);
+state.process_packet(make_packet(expected_reference('QPSK'), 100, 0), state.start_time);
 for n = 1:3
     state.process_packet(make_packet(expected_reference('QPSK') * 1.05, 100 + n * 10, 0), ...
         state.start_time + milliseconds(n));
@@ -576,6 +599,8 @@ fig = testCase.TestData.fig;
 start_local(fig);
 state = guidata(fig);
 state.process_packet(make_packet(expected_reference('QPSK') * 1.05, 4294967294, 2), state.start_time);
+state.process_packet(make_packet(expected_reference('QPSK') * 1.05, 4294967294, 2), ...
+    state.start_time + milliseconds(1));
 state = guidata(fig);
 testCase.verifyEqual(get(state.metric_values(1), 'String'), '5.000 %');
 testCase.verifyEqual(get(state.metric_values(2), 'String'), '--');
@@ -588,6 +613,8 @@ end
 testCase.verifyEqual(get(state.metric_values(2), 'String'), '2.9957e-05');
 testCase.verifyEqual(get(state.per_details, 'String'), '本轮错包/收包 0/100000');
 testCase.verifyEqual(get(state.summary_values(4), 'String'), '板卡累计');
+testCase.verifyEqual(get(state.summary_values(1), 'String'), ...
+    {'数据更新：5 次'; '本次新增：90000 包'});
 testCase.verifyEqual(get(state.metric_values(5), 'String'), '-31.250 dB');
 for ax = state.metric_axes.'
     testCase.verifyEqual(char(get(ax, 'XGrid')), 'on');
@@ -601,10 +628,13 @@ for control = controls.'
 end
 originalPosition = get(fig, 'Position');
 actualDetail = get(state.per_details, 'String');
+actualUpdate = get(state.summary_values(1), 'String');
 longestDetail = '计数异常  本轮错包/收包 4294967294/4294967294';
 for dimensions = [1480 900; 1200 760].'
     set(fig, 'Position', [originalPosition(1:2) dimensions.']);
     set(state.per_details, 'String', longestDetail);
+    set(state.summary_values(1), 'String', ...
+        {'数据更新：4294967294 次'; '本次新增：4294967294 包'});
     drawnow;
     metricLabels = [findall(fig, 'Type', 'uicontrol', 'Style', 'text', 'String', 'PER · 95% 上限'); ...
         findall(fig, 'Type', 'uicontrol', 'Style', 'text', 'String', '推算 BER · 95% 上限')];
@@ -630,6 +660,7 @@ for dimensions = [1480 900; 1200 760].'
         end
     end
     set(state.per_details, 'String', actualDetail);
+    set(state.summary_values(1), 'String', actualUpdate);
     if dimensions(1) == 1200
         print(fig, '-RGBImage', '-r150');
         preview = print(fig, '-RGBImage', '-r150');
@@ -640,6 +671,109 @@ set(fig, 'Position', originalPosition);
 state.stop_capture();
 state = guidata(fig);
 imwrite(state.pending_capture.dashboard_image, fullfile(testCase.TestData.runRoot, 'offline_layout_preview.png'));
+end
+
+function testBaselineBeforeFirstUpdateAndSavedIncrements(testCase)
+fig = testCase.TestData.fig;
+start_local(fig);
+state = guidata(fig);
+reference = expected_reference('QPSK');
+baselineAt = state.start_time + milliseconds(3);
+state.process_packet(make_packet(reference * 1.5, 100000, 17), baselineAt);
+state = guidata(fig);
+testCase.verifyEmpty(state.packet_records);
+testCase.verifyEqual(state.counter_baseline.receive_time, baselineAt);
+testCase.verifyEqual(state.counter_baseline.pac_rx_cnt, 100000);
+testCase.verifyEqual(state.counter_baseline.pac_rx_crc_err_cnt, 17);
+testCase.verifyEqual(get(state.summary_values(1), 'String'), ...
+    {'数据更新：0 次'; '本次新增：--'});
+testCase.verifyTrue(all(isnan(get(state.constellation_line, 'XData'))));
+testCase.verifyEqual(get(state.metric_values(1), 'String'), '--');
+testCase.verifyEqual(get(state.save_button, 'Enable'), 'off');
+
+firstAt = baselineAt + milliseconds(50);
+state.process_packet(make_packet(reference * 1.05, 101912, 17), firstAt);
+state = guidata(fig);
+testCase.assertNumElements(state.packet_records, 1);
+record = state.packet_records(1);
+testCase.verifyEqual(record.packet_number, 1);
+testCase.verifyEqual(record.receive_time, firstAt);
+testCase.verifyEqual(record.rx_packet_increment, 1912);
+testCase.verifyEqual(record.per_sample_count, 1912);
+testCase.verifyEqual(record.per_error_count, 0);
+testCase.verifyEqual(record.evm_rms_percent, 5, 'AbsTol', 1e-10);
+testCase.verifyEqual(record.per_upper_95, -expm1(log(0.05) / 1912));
+testCase.verifyEqual(get(state.summary_values(1), 'String'), ...
+    {'数据更新：1 次'; '本次新增：1912 包'});
+state.process_packet(make_packet(reference, 103823, 18), firstAt + milliseconds(50));
+state = guidata(fig);
+testCase.verifyEqual([state.packet_records.rx_packet_increment], [1912 1911]);
+testCase.verifyEqual(state.packet_records(2).per_sample_count, 3823);
+testCase.verifyEqual(state.packet_records(2).per_error_count, 1);
+state.stop_capture();
+state = guidata(fig);
+capture = state.pending_capture;
+invoke(state.save_button);
+state = guidata(fig);
+verify_saved(testCase, state.last_output_folder, capture);
+saved = load(fullfile(state.last_output_folder, 'metrics_recording.mat'));
+testCase.verifyEqual(saved.packetMetrics.rx_packet_increment, [1912; 1911]);
+testCase.verifyEqual(saved.metadata.counter_baseline.pac_rx_cnt, 100000);
+testCase.verifyEqual(string(saved.metadata.counter_baseline.receive_time), format_test_time(baselineAt));
+testCase.verifyEqual(saved.metadata.packet_count, 2);
+testCase.verifyEqual(saved.metadata.point_count, 2 * numel(reference));
+testCase.verifyEqual(get(state.status, 'String'), ...
+    sprintf('已保存 2 次更新 / %d 个点', 2 * numel(reference)));
+end
+
+function testBaselineOnlyStopForEveryMode(testCase)
+fig = testCase.TestData.fig;
+for name = {'QPSK', '8PSK', '16QAM'}
+    select_mode(fig, name{1});
+    start_local(fig);
+    state = guidata(fig);
+    testCase.verifyEmpty(state.counter_baseline);
+    state.process_packet(make_packet(expected_reference(name{1}), 5000, 3), state.start_time);
+    state = guidata(fig);
+    testCase.verifyEmpty(state.packet_records);
+    testCase.verifyEqual(state.counter_baseline.pac_rx_cnt, 5000);
+    state.stop_capture();
+    verify_idle(testCase, fig);
+    state = guidata(fig);
+    testCase.verifyEmpty(state.pending_capture);
+    testCase.verifyEqual(get(state.save_button, 'Enable'), 'off');
+    invoke(state.save_button);
+    testCase.verifyFalse(isfolder(state.output_root));
+end
+end
+
+function testInvalidBaselineAndUnavailableIncrement(testCase)
+fig = testCase.TestData.fig;
+start_local(fig);
+state = guidata(fig);
+reference = expected_reference('QPSK');
+state.process_packet(make_packet(reference, NaN, 0), state.start_time);
+state = guidata(fig);
+testCase.verifyEmpty(state.counter_baseline);
+testCase.verifyEmpty(state.packet_records);
+testCase.verifySubstring(get(state.status, 'String'), '计数起点无效');
+state.process_packet(make_packet(reference, 100, 0), state.start_time + milliseconds(1));
+state.process_packet(make_packet(reference, 110, 0), state.start_time + milliseconds(2));
+state.process_packet(make_packet(reference, 110, 0), state.start_time + milliseconds(3));
+state = guidata(fig);
+testCase.verifyEqual([state.packet_records.rx_packet_increment], [10 0]);
+testCase.verifyEqual(get(state.summary_values(1), 'String'), ...
+    {'数据更新：2 次'; '本次新增：0 包'});
+state.process_packet(make_packet(reference, 109, 0), state.start_time + milliseconds(4));
+state = guidata(fig);
+testCase.verifyTrue(isnan(state.packet_records(end).rx_packet_increment));
+testCase.verifyEqual(get(state.summary_values(1), 'String'), ...
+    {'数据更新：3 次'; '本次新增：--'});
+state.stop_capture();
+state = guidata(fig);
+capture = state.pending_capture;
+invoke(state.save_button);
+verify_saved(testCase, guidata(fig).last_output_folder, capture);
 end
 
 function select_mode(fig, name)
@@ -772,6 +906,13 @@ testCase.verifyEqual(metadata.per_confidence_level, 0.95);
 testCase.verifyEqual(metadata.per_upper_method, 'One-sided Clopper-Pearson');
 testCase.verifyFalse(metadata.per_counter_basis_verified);
 testCase.verifySubstring(metadata.per_confidence_scope, 'Pointwise');
+testCase.verifyEqual(metadata.counter_baseline.pac_tx_cnt, capture.counter_baseline.pac_tx_cnt);
+testCase.verifyEqual(metadata.counter_baseline.pac_rx_cnt, capture.counter_baseline.pac_rx_cnt);
+testCase.verifyEqual(metadata.counter_baseline.pac_rx_crc_ok_cnt, capture.counter_baseline.pac_rx_crc_ok_cnt);
+testCase.verifyEqual(metadata.counter_baseline.pac_rx_crc_err_cnt, capture.counter_baseline.pac_rx_crc_err_cnt);
+testCase.verifyEqual(string(metadata.counter_baseline.receive_time), ...
+    format_test_time(capture.counter_baseline.receive_time));
+testCase.verifySubstring(metadata.rx_packet_increment_definition, 'update 1 uses counter_baseline');
 testCase.verifySubstring(metadata.ber_type, 'Observed-PER');
 testCase.verifySubstring(metadata.ber_upper_95_definition, 'per_upper_95');
 testCase.verifyEqual(metadata.ber_packet_length_bits, 108000);
@@ -788,7 +929,7 @@ expectedTimes = format_test_times([records.receive_time]');
 testCase.verifyEqual(metrics.packet_number, [records.packet_number]');
 testCase.verifyClass(metrics.receive_time, 'char');
 testCase.verifyEqual(string(metrics.receive_time), expectedTimes);
-metricFields = {'elapsed_seconds', 'pac_tx_cnt', 'pac_rx_cnt', ...
+metricFields = {'elapsed_seconds', 'pac_tx_cnt', 'pac_rx_cnt', 'rx_packet_increment', ...
     'pac_rx_crc_ok_cnt', 'pac_rx_crc_err_cnt', 'evm_rms_percent', 'mer_db', ...
     'per', 'per_upper_95', 'per_sample_count', 'per_error_count', 'ber_estimate', 'ber_upper_95'};
 testCase.verifyEqual(sort(fieldnames(metrics)), ...
