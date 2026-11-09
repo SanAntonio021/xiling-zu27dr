@@ -95,6 +95,7 @@ for k = 1:numel(names)
             testCase.verifyTrue(isnan(recorded.per));
             testCase.verifyTrue(isnan(recorded.per_upper_95));
             testCase.verifyTrue(isnan(recorded.ber_estimate));
+            testCase.verifyTrue(isnan(recorded.ber_upper_95));
         else
             errorMagnitude = abs(factors(n) - 1);
             testCase.verifyEqual(recorded.evm_rms_percent, 100 * errorMagnitude, 'AbsTol', 1e-9);
@@ -110,6 +111,7 @@ for k = 1:numel(names)
     end
     testCase.verifyEqual(get(state.metric_lines(1), 'YData'), [state.packet_records.evm_rms_percent]);
     testCase.verifyEqual(get(state.metric_lines(2), 'YData'), [state.packet_records.per_upper_95]);
+    testCase.verifyEqual(get(state.metric_lines(3), 'YData'), [state.packet_records.ber_upper_95]);
     testCase.verifyEqual(get(state.metric_lines(4), 'YData'), [state.packet_records.mer_db]);
     state.stop_capture();
     verify_idle(testCase, fig);
@@ -203,6 +205,7 @@ for cycle = 1:2
     testCase.verifyEqual(state.packet_records(1).packet_number, 1);
     testCase.verifyTrue(isnan(state.packet_records(1).per));
     testCase.verifyTrue(isnan(state.packet_records(1).per_upper_95));
+    testCase.verifyTrue(isnan(state.packet_records(1).ber_upper_95));
     testCase.verifyEqual(state.packet_records(1).per_sample_count, 0);
     testCase.verifyEqual(state.packet_records(1).per_error_count, 0);
     testCase.verifyEqual(get(state.metric_values(2), 'String'), '--');
@@ -228,7 +231,7 @@ state = guidata(fig);
 testCase.verifyTrue(isnan(state.packet_records(end).per_upper_95));
 testCase.verifyEqual(get(state.metric_values(2), 'String'), '--');
 testCase.verifyEqual(get(state.metric_values(3), 'String'), '--');
-testCase.verifyEqual(get(state.per_details, 'String'), '观测 PER --  本轮错包/收包 0/0');
+testCase.verifyEqual(get(state.per_details, 'String'), '本轮错包/收包 0/0');
 
 sampleCounts = [1 10 1000 100000 1000000000];
 upperBounds = zeros(size(sampleCounts));
@@ -240,16 +243,19 @@ for index = 1:numel(sampleCounts)
     upperBounds(index) = record.per_upper_95;
     testCase.verifyEqual(record.per, 0);
     testCase.verifyEqual(record.ber_estimate, 0);
+    testCase.verifyEqual(record.ber_upper_95, -expm1(log1p(-record.per_upper_95) / 108000));
     testCase.verifyEqual(record.per_sample_count, n);
     testCase.verifyEqual(record.per_error_count, 0);
     testCase.verifyEqual((1 - record.per_upper_95)^n, 0.05, 'AbsTol', 1e-7);
     testCase.verifyEqual(get(state.metric_values(2), 'String'), sprintf('%.4e', record.per_upper_95));
+    testCase.verifyEqual(get(state.metric_values(3), 'String'), sprintf('%.4e', record.ber_upper_95));
+    testCase.verifyEqual(get(state.metric_axes(2), 'XLim'), [0 index / 1000], 'AbsTol', 1e-10);
 end
 testCase.verifyLessThan(diff(upperBounds), zeros(1, numel(upperBounds) - 1));
 testCase.verifyEqual(upperBounds(1), 0.95, 'AbsTol', 1e-14);
 testCase.verifyEqual(upperBounds(4), 2.995687401942795e-5, 'AbsTol', 1e-15);
 testCase.verifyEqual(get(state.metric_lines(2), 'YData'), [state.packet_records.per_upper_95]);
-testCase.verifyEqual(get(state.per_details, 'String'), '观测 PER 0.0000e+00  本轮错包/收包 0/1000000000');
+testCase.verifyEqual(get(state.per_details, 'String'), '本轮错包/收包 0/1000000000');
 previous = state.packet_records(end);
 state.process_packet(make_packet(reference, 100 + sampleCounts(end), 7), ...
     state.start_time + milliseconds(100));
@@ -279,6 +285,7 @@ for index = 1:numel(samples)
     testCase.verifyEqual(record.per, k / n);
     testCase.verifyGreaterThanOrEqual(record.per_upper_95, record.per);
     testCase.verifyLessThanOrEqual(record.per_upper_95, 1);
+    testCase.verifyEqual(record.ber_upper_95, -expm1(log1p(-record.per_upper_95) / 108000));
     if k < n
         % Independently invert the binomial CDF using direct finite summation.
         j = 0:k;
@@ -316,9 +323,36 @@ testCase.verifyEqual(record.per_error_count, 2);
 testCase.verifyTrue(isnan(record.per));
 testCase.verifyTrue(isnan(record.per_upper_95));
 testCase.verifyTrue(isnan(record.ber_estimate));
+testCase.verifyTrue(isnan(record.ber_upper_95));
 testCase.verifyEqual(get(state.metric_values(2), 'String'), '--');
 testCase.verifyEqual(get(state.metric_values(3), 'String'), '--');
 testCase.verifyEqual(get(state.per_details, 'String'), '计数异常  本轮错包/收包 2/1');
+end
+
+function testFullSessionUpperBoundTrends(testCase)
+fig = testCase.TestData.fig;
+start_local(fig);
+state = guidata(fig);
+reference = expected_reference('QPSK');
+for n = 1:60
+    state.process_packet(make_packet(reference, n * 10, 0), state.start_time + seconds(n));
+end
+state = guidata(fig);
+for index = [2 3]
+    testCase.verifyNumElements(get(state.metric_lines(index), 'XData'), 60);
+    testCase.verifyEqual(get(state.metric_axes(index), 'XLim'), [0 60]);
+end
+for index = [1 4 5]
+    testCase.verifyNumElements(get(state.metric_lines(index), 'XData'), 50);
+    testCase.verifyEqual(get(state.metric_axes(index), 'XLim'), [11 60]);
+end
+testCase.verifyEqual(get(state.metric_lines(3), 'YData'), [state.packet_records.ber_upper_95]);
+state.stop_capture();
+start_local(fig);
+state = guidata(fig);
+testCase.verifyEmpty(state.packet_records);
+testCase.verifyTrue(all(isnan(get(state.metric_lines(2), 'YData'))));
+testCase.verifyTrue(all(isnan(get(state.metric_lines(3), 'YData'))));
 end
 
 function testZeroDataStopForEveryMode(testCase)
@@ -552,7 +586,7 @@ for n = [100 1000 10000 100000]
     state = guidata(fig);
 end
 testCase.verifyEqual(get(state.metric_values(2), 'String'), '2.9957e-05');
-testCase.verifyEqual(get(state.per_details, 'String'), '观测 PER 0.0000e+00  本轮错包/收包 0/100000');
+testCase.verifyEqual(get(state.per_details, 'String'), '本轮错包/收包 0/100000');
 testCase.verifyEqual(get(state.summary_values(4), 'String'), '板卡累计');
 testCase.verifyEqual(get(state.metric_values(5), 'String'), '-31.250 dB');
 for ax = state.metric_axes.'
@@ -567,19 +601,20 @@ for control = controls.'
 end
 originalPosition = get(fig, 'Position');
 actualDetail = get(state.per_details, 'String');
-longestDetail = '观测 PER 1.0000e+00  本轮错包/收包 4294967294/4294967294';
+longestDetail = '计数异常  本轮错包/收包 4294967294/4294967294';
 for dimensions = [1480 900; 1200 760].'
     set(fig, 'Position', [originalPosition(1:2) dimensions.']);
     set(state.per_details, 'String', longestDetail);
     drawnow;
-    metricLabels = findall(fig, 'Type', 'uicontrol', 'Style', 'text', 'String', 'PER 95% 上限');
+    metricLabels = [findall(fig, 'Type', 'uicontrol', 'Style', 'text', 'String', 'PER · 95% 上限'); ...
+        findall(fig, 'Type', 'uicontrol', 'Style', 'text', 'String', '推算 BER · 95% 上限')];
     for control = [state.summary_values; state.metric_values; state.per_details; metricLabels].'
         position = get(control, 'Position');
         extent = get(control, 'Extent');
         testCase.verifyLessThanOrEqual(extent(3), position(3) + 0.002);
         testCase.verifyLessThanOrEqual(extent(4), position(4) + 0.002);
     end
-    metricNames = {'EVM RMS', 'PER 95% 上限', 'BER estimate', 'MER', 'Rx IF Power'};
+    metricNames = {'EVM RMS', 'PER · 95% 上限', '推算 BER · 95% 上限', 'MER', 'Rx IF Power'};
     for metricIndex = 1:numel(metricNames)
         label = findall(fig, 'Type', 'uicontrol', 'Style', 'text', 'String', metricNames{metricIndex});
         axisPosition = get(state.metric_axes(metricIndex), 'Position');
@@ -738,6 +773,7 @@ testCase.verifyEqual(metadata.per_upper_method, 'One-sided Clopper-Pearson');
 testCase.verifyFalse(metadata.per_counter_basis_verified);
 testCase.verifySubstring(metadata.per_confidence_scope, 'Pointwise');
 testCase.verifySubstring(metadata.ber_type, 'Observed-PER');
+testCase.verifySubstring(metadata.ber_upper_95_definition, 'per_upper_95');
 testCase.verifyEqual(metadata.ber_packet_length_bits, 108000);
 testCase.verifySubstring(metadata.receive_time_definition, 'Computer UDP callback');
 testCase.verifySubstring(metadata.rx_if_power_definition, 'not calibrated RSSI');
@@ -754,7 +790,7 @@ testCase.verifyClass(metrics.receive_time, 'char');
 testCase.verifyEqual(string(metrics.receive_time), expectedTimes);
 metricFields = {'elapsed_seconds', 'pac_tx_cnt', 'pac_rx_cnt', ...
     'pac_rx_crc_ok_cnt', 'pac_rx_crc_err_cnt', 'evm_rms_percent', 'mer_db', ...
-    'per', 'per_upper_95', 'per_sample_count', 'per_error_count', 'ber_estimate'};
+    'per', 'per_upper_95', 'per_sample_count', 'per_error_count', 'ber_estimate', 'ber_upper_95'};
 testCase.verifyEqual(sort(fieldnames(metrics)), ...
     sort([metricFields(:); {'packet_number'; 'receive_time'; 'rx_if_power'}]));
 for field = metricFields
