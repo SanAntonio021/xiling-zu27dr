@@ -87,9 +87,27 @@ initialState.save_button = uicontrol(fig, 'Style', 'pushbutton', 'String', 'SAVE
     'BackgroundColor', [0.72 0.72 0.72], 'ForegroundColor', [0.35 0.35 0.35], ...
     'TooltipString', 'Save the completed START-to-STOP capture.', 'Callback', @save_capture);
 initialState.status = uicontrol(fig, 'Style', 'text', 'String', '就绪', ...
-    'Units', 'normalized', 'Position', [0.035 0.885 0.93 0.03], ...
+    'Units', 'normalized', 'Position', [0.035 0.885 0.51 0.03], ...
     'ForegroundColor', [0.35 0.95 0.45], 'BackgroundColor', [0.02 0.02 0.02], ...
     'HorizontalAlignment', 'left', 'FontSize', 11, 'Tag', 'WPR_Metrics_Status');
+initialState.file_name_label = uicontrol(fig, 'Style', 'text', 'String', '文件名称', ...
+    'Units', 'normalized', 'Position', [0.56 0.885 0.085 0.03], ...
+    'ForegroundColor', [0.85 0.9 0.85], 'BackgroundColor', [0.02 0.02 0.02], ...
+    'HorizontalAlignment', 'left', 'FontSize', 11);
+initialState.file_name_edit = uicontrol(fig, 'Style', 'edit', 'String', '', ...
+    'Units', 'normalized', 'Position', [0.65 0.883 0.31 0.037], ...
+    'BackgroundColor', 'white', 'ForegroundColor', 'black', 'FontSize', 10, ...
+    'HorizontalAlignment', 'left', 'Tag', 'WPR_Metrics_FileName', ...
+    'Callback', @refresh_file_name_hint, 'KeyReleaseFcn', @refresh_file_name_hint, ...
+    'TooltipString', ['可留空；填写后作为保存文件夹的前缀，自动补上本轮调制和开始时间。' ...
+    'STOP 后也可修改，保存后保留供下一轮使用。']);
+% Keep the hint separate from String so it can never become a saved name.
+initialState.file_name_hint = uicontrol(fig, 'Style', 'text', ...
+    'String', '输入要保存的文件名称，留空自动命名', ...
+    'Units', 'normalized', 'Position', [0.655 0.886 0.30 0.029], ...
+    'BackgroundColor', 'white', 'ForegroundColor', [0.45 0.45 0.45], 'FontSize', 10, ...
+    'HorizontalAlignment', 'left', 'Enable', 'inactive', ...
+    'Tag', 'WPR_Metrics_FileNameHint', 'ButtonDownFcn', @focus_file_name);
 guidata(fig, initialState);
 
 summaryPositions = [0.045 0.055 0.25 0.060; 0.31 0.062 0.15 0.036; ...
@@ -201,6 +219,22 @@ end
 
 clear_display(guidata(fig));
 
+function focus_file_name(~, ~)
+    state = guidata(fig);
+    if ~state.running && ~state.saving && ~state.stopping
+        uicontrol(state.file_name_edit);
+    end
+end
+
+function refresh_file_name_hint(~, ~)
+    state = guidata(fig);
+    if isempty(strtrim(get(state.file_name_edit, 'String')))
+        set(state.file_name_hint, 'Visible', 'on');
+    else
+        set(state.file_name_hint, 'Visible', 'off');
+    end
+end
+
 function select_modulation(~, event)
     state = guidata(fig);
     if state.running || state.saving || state.stopping
@@ -275,10 +309,17 @@ function update_save_button(state)
     if ~state.running && ~state.saving && ~isempty(state.pending_capture)
         set(state.save_button, 'Enable', 'on', 'BackgroundColor', [1 0.63 0.14], ...
             'ForegroundColor', [0.1 0.08 0.04]);
+        set(state.file_name_edit, 'BackgroundColor', [1 0.96 0.80]);
+        set(state.file_name_hint, 'BackgroundColor', [1 0.96 0.80]);
+        set(state.file_name_label, 'ForegroundColor', [1 0.63 0.14]);
     else
         set(state.save_button, 'Enable', 'off', 'BackgroundColor', [0.72 0.72 0.72], ...
             'ForegroundColor', [0.35 0.35 0.35]);
+        set(state.file_name_edit, 'BackgroundColor', 'white');
+        set(state.file_name_hint, 'BackgroundColor', 'white');
+        set(state.file_name_label, 'ForegroundColor', [0.85 0.9 0.85]);
     end
+    refresh_file_name_hint([], []);
 end
 
 function show_idle_status(state, message)
@@ -297,7 +338,7 @@ function set_capture_controls(state, busy)
     else
         enabled = 'on';
     end
-    set([state.start_button; state.apply_ip_button; state.ip_edit; ...
+    set([state.start_button; state.apply_ip_button; state.ip_edit; state.file_name_edit; ...
         state.modulation_buttons(:)], 'Enable', enabled);
 end
 
@@ -622,6 +663,13 @@ function save_capture(~, ~)
     if state.running || state.saving || state.stopping || isempty(state.pending_capture)
         return;
     end
+    fileName = strtrim(get(state.file_name_edit, 'String'));
+    if any(ismember(fileName, '<>:"/\|?*')) || any(fileName < 32)
+        set(state.status, 'String', '文件名称不能包含 < > : " / \ | ? * 或控制字符', ...
+            'ForegroundColor', [1 0.3 0.25]);
+        return;
+    end
+    set(state.file_name_edit, 'String', fileName);
     capture = state.pending_capture;
     state.saving = true;
     set_capture_controls(state, true);
@@ -632,10 +680,13 @@ function save_capture(~, ~)
         if isempty(capture.dashboard_image)
             error('WPR:MissingSnapshot', 'The stopped dashboard image is unavailable; capture data remains in memory.');
         end
-        outputFolder = create_record_folder(state.output_root);
+        [outputFolder, folderName] = create_record_folder(state.output_root, fileName, ...
+            capture.modulation_config.name, capture.start_time);
         [packetMetrics, constellationPoints, metadata] = ...
             build_record_data(capture.packet_records, capture.start_time, capture.end_time, ...
             capture.active_ip, capture.modulation_config, capture.counter_baseline);
+        metadata.file_name_prefix = fileName;
+        metadata.record_folder_name = folderName;
         save(fullfile(outputFolder, 'metrics_recording.mat'), ...
             'constellationPoints', 'packetMetrics', 'metadata', '-v7.3');
         imwrite(capture.dashboard_image, fullfile(outputFolder, 'dashboard.png'));
@@ -890,16 +941,23 @@ timeValue.Format = 'yyyy-MM-dd HH:mm:ss.SSS';
 formatted = char(string(timeValue));
 end
 
-function outputFolder = create_record_folder(outputRoot)
+function [outputFolder, folderName] = create_record_folder(outputRoot, fileName, modulation, startTime)
 if ~exist(outputRoot, 'dir')
     mkdir(outputRoot);
 end
-stamp = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
-baseName = ['constellation_' stamp];
+startTime.Format = 'yyyyMMdd_HHmmss';
+stamp = char(startTime);
+if isempty(fileName)
+    baseName = ['constellation_' stamp];
+else
+    baseName = [fileName '_' modulation '_' stamp];
+end
+folderName = baseName;
 outputFolder = fullfile(outputRoot, baseName);
 suffix = 1;
-while exist(outputFolder, 'dir')
-    outputFolder = fullfile(outputRoot, sprintf('%s_%d', baseName, suffix));
+while isfolder(outputFolder) || isfile(outputFolder)
+    folderName = sprintf('%s_%d', baseName, suffix);
+    outputFolder = fullfile(outputRoot, folderName);
     suffix = suffix + 1;
 end
 mkdir(outputFolder);

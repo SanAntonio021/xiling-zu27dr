@@ -49,6 +49,7 @@ fig = testCase.TestData.fig;
 state = guidata(fig);
 testCase.verifyEqual(state.modulation_config.name, 'QPSK');
 testCase.verifyEqual(get(state.save_button, 'Enable'), 'off');
+testCase.verifyEqual(get(state.file_name_edit, 'String'), '');
 testCase.verifyEqual(get(state.modulation_group.SelectedObject, 'Tag'), 'QPSK');
 names = {'QPSK', '8PSK', '16QAM'};
 for k = 1:numel(names)
@@ -550,6 +551,164 @@ verify_saved(testCase, state.last_output_folder, capture);
 testCase.verifyEmpty(state.pending_capture);
 end
 
+function testFileNameUsesStoppedCaptureAndStaysForNextRun(testCase)
+fig = testCase.TestData.fig;
+select_mode(fig, '16QAM');
+start_local(fig);
+state = guidata(fig);
+state.start_time = state.start_time - seconds(90);
+guidata(fig, state);
+state.process_packet(make_packet(expected_reference('16QAM'), 99, 0), state.start_time);
+state.process_packet(make_packet(expected_reference('16QAM'), 100, 0), state.start_time);
+state.stop_capture();
+state = guidata(fig);
+capture = state.pending_capture;
+select_mode(fig, '8PSK');
+state = guidata(fig);
+set(state.file_name_edit, 'String', '  103GHz_正向_衰减10dB  ');
+invoke(state.save_button);
+state = guidata(fig);
+verify_saved(testCase, state.last_output_folder, capture);
+saved = load(fullfile(state.last_output_folder, 'metrics_recording.mat'), 'metadata');
+stamp = capture.start_time;
+stamp.Format = 'yyyyMMdd_HHmmss';
+expectedFolder = ['103GHz_正向_衰减10dB_16QAM_' char(stamp)];
+testCase.verifyEqual(state.last_output_folder, fullfile(state.output_root, expectedFolder));
+testCase.verifyEqual(saved.metadata.file_name_prefix, '103GHz_正向_衰减10dB');
+testCase.verifyEqual(saved.metadata.record_folder_name, expectedFolder);
+testCase.verifyEqual(get(state.file_name_edit, 'String'), '103GHz_正向_衰减10dB');
+start_local(fig);
+state = guidata(fig);
+testCase.verifyEqual(get(state.file_name_edit, 'String'), '103GHz_正向_衰减10dB');
+state.stop_capture();
+end
+
+function testFileNameHintAndPendingSaveHighlight(testCase)
+fig = testCase.TestData.fig;
+state = guidata(fig);
+testCase.verifyEqual(get(state.file_name_hint, 'String'), '输入要保存的文件名称，留空自动命名');
+testCase.verifyEqual(char(get(state.file_name_hint, 'Visible')), 'on');
+testCase.verifyEqual(get(state.file_name_edit, 'String'), '');
+testCase.verifyEqual(get(state.file_name_edit, 'BackgroundColor'), [1 1 1]);
+start_local(fig);
+state = guidata(fig);
+testCase.verifyEqual(get(state.file_name_edit, 'BackgroundColor'), [1 1 1]);
+state.process_packet(make_packet(expected_reference('QPSK'), 99, 0), state.start_time);
+state.process_packet(make_packet(expected_reference('QPSK'), 100, 0), state.start_time);
+state.stop_capture();
+state = guidata(fig);
+capture = state.pending_capture;
+verify_unsaved(testCase, state);
+testCase.verifyEqual(char(get(state.file_name_hint, 'Visible')), 'on');
+imwrite(capture.dashboard_image, fullfile(testCase.TestData.runRoot, 'file_name_pending_hint.png'));
+set(state.file_name_edit, 'String', '命名检查');
+callback = get(state.file_name_edit, 'KeyReleaseFcn');
+callback(state.file_name_edit, []);
+testCase.verifyEqual(char(get(state.file_name_hint, 'Visible')), 'off');
+set(state.file_name_edit, 'String', '');
+invoke(state.file_name_edit);
+testCase.verifyEqual(char(get(state.file_name_hint, 'Visible')), 'on');
+invoke(state.save_button);
+state = guidata(fig);
+verify_saved(testCase, state.last_output_folder, capture);
+saved = load(fullfile(state.last_output_folder, 'metrics_recording.mat'), 'metadata');
+testCase.verifyEmpty(saved.metadata.file_name_prefix);
+testCase.verifyEqual(char(get(state.file_name_hint, 'Visible')), 'on');
+testCase.verifyEqual(get(state.file_name_edit, 'BackgroundColor'), [1 1 1]);
+testCase.verifyEqual(get(state.file_name_label, 'ForegroundColor'), [0.85 0.9 0.85]);
+end
+
+function testBlankFileNameAndExistingPathsAreNotOverwritten(testCase)
+fig = testCase.TestData.fig;
+start_local(fig);
+state = guidata(fig);
+state.process_packet(make_packet(expected_reference('QPSK'), 99, 0), state.start_time);
+state.process_packet(make_packet(expected_reference('QPSK'), 100, 0), state.start_time);
+state.stop_capture();
+state = guidata(fig);
+capture = state.pending_capture;
+stamp = capture.start_time;
+stamp.Format = 'yyyyMMdd_HHmmss';
+baseName = ['constellation_' char(stamp)];
+existingFolder = fullfile(state.output_root, baseName);
+mkdir(existingFolder);
+existingFile = fullfile(state.output_root, [baseName '_1']);
+fid = fopen(existingFile, 'w');
+fprintf(fid, 'keep this existing file');
+fclose(fid);
+set(state.file_name_edit, 'String', '   ');
+invoke(state.save_button);
+state = guidata(fig);
+verify_saved(testCase, state.last_output_folder, capture);
+testCase.verifyEqual(state.last_output_folder, fullfile(state.output_root, [baseName '_2']));
+testCase.verifyTrue(isfolder(existingFolder));
+testCase.verifyEqual(fileread(existingFile), 'keep this existing file');
+saved = load(fullfile(state.last_output_folder, 'metrics_recording.mat'), 'metadata');
+testCase.verifyEmpty(saved.metadata.file_name_prefix);
+testCase.verifyEqual(saved.metadata.record_folder_name, [baseName '_2']);
+end
+
+function testOfflinePreviewWithoutBoard(testCase)
+originalFigure = testCase.TestData.fig;
+originalState = guidata(originalFigure);
+testCase.verifyError(@() WPR_Metrics_Preview, 'WPR:PreviewWindowExists');
+testCase.verifyEqual(guidata(originalFigure), originalState);
+close(originalFigure);
+fig = WPR_Metrics_Preview;
+testCase.TestData.fig = fig;
+state = guidata(fig);
+testCase.verifyFalse(state.running);
+testCase.verifyEmpty(state.client);
+testCase.verifyEmpty(state.request_timer);
+testCase.verifyEqual(state.active_ip, 'OFFLINE_PREVIEW');
+testCase.verifySubstring(get(fig, 'Name'), '模拟数据');
+testCase.verifySubstring(get(state.constellation_axes.Title, 'String'), '模拟数据');
+testCase.verifyEqual(numel(state.pending_capture.packet_records), 50);
+testCase.verifyEqual(get(state.file_name_edit, 'BackgroundColor'), [1 0.96 0.80]);
+testCase.verifyEqual(get(state.save_button, 'Enable'), 'on');
+state.output_root = tempname(testCase.TestData.runRoot);
+guidata(fig, state);
+set(state.file_name_edit, 'String', '离线预览测试');
+capture = state.pending_capture;
+invoke(state.save_button);
+state = guidata(fig);
+verify_saved(testCase, state.last_output_folder, capture);
+saved = load(fullfile(state.last_output_folder, 'metrics_recording.mat'), 'metadata');
+testCase.verifyEqual(saved.metadata.source_ip, 'OFFLINE_PREVIEW');
+testCase.verifyEqual(saved.metadata.file_name_prefix, '离线预览测试');
+invoke(state.start_button);
+invoke(state.apply_ip_button);
+state = guidata(fig);
+testCase.verifyFalse(state.running);
+testCase.verifyEmpty(state.client);
+testCase.verifyEmpty(state.request_timer);
+end
+
+function testInvalidFileNameKeepsCaptureForCorrection(testCase)
+fig = testCase.TestData.fig;
+start_local(fig);
+state = guidata(fig);
+state.process_packet(make_packet(expected_reference('QPSK'), 99, 0), state.start_time);
+state.process_packet(make_packet(expected_reference('QPSK'), 100, 0), state.start_time);
+state.stop_capture();
+state = guidata(fig);
+capture = state.pending_capture;
+for invalidCharacter = ['<>:"/\|?*' char(1)]
+    set(state.file_name_edit, 'String', ['test' invalidCharacter 'name']);
+    invoke(state.save_button);
+    state = guidata(fig);
+    testCase.verifySubstring(get(state.status, 'String'), '文件名称不能包含');
+    testCase.verifyEqual(state.pending_capture, capture);
+    testCase.verifyEqual(get(state.save_button, 'Enable'), 'on');
+    testCase.verifyFalse(isfolder(state.output_root));
+    verify_idle(testCase, fig);
+end
+set(state.file_name_edit, 'String', '修正后');
+invoke(state.save_button);
+state = guidata(fig);
+verify_saved(testCase, state.last_output_folder, capture);
+end
+
 function testNativePointArraysKeepVariableReportLengths(testCase)
 fig = testCase.TestData.fig;
 start_local(fig);
@@ -638,12 +797,18 @@ for dimensions = [1480 900; 1200 760].'
     drawnow;
     metricLabels = [findall(fig, 'Type', 'uicontrol', 'Style', 'text', 'String', 'PER · 95% 上限'); ...
         findall(fig, 'Type', 'uicontrol', 'Style', 'text', 'String', '推算 BER · 95% 上限')];
-    for control = [state.summary_values; state.metric_values; state.per_details; metricLabels].'
+    for control = [state.summary_values; state.metric_values; state.per_details; ...
+            metricLabels; state.file_name_label; state.file_name_hint].'
         position = get(control, 'Position');
         extent = get(control, 'Extent');
         testCase.verifyLessThanOrEqual(extent(3), position(3) + 0.002);
         testCase.verifyLessThanOrEqual(extent(4), position(4) + 0.002);
     end
+    statusPosition = get(state.status, 'Position');
+    namePosition = get(state.file_name_label, 'Position');
+    editPosition = get(state.file_name_edit, 'Position');
+    testCase.verifyLessThan(statusPosition(1) + statusPosition(3), namePosition(1));
+    testCase.verifyLessThan(namePosition(1) + namePosition(3), editPosition(1));
     metricNames = {'EVM RMS', 'PER · 95% 上限', '推算 BER · 95% 上限', 'MER', 'Rx IF Power'};
     for metricIndex = 1:numel(metricNames)
         label = findall(fig, 'Type', 'uicontrol', 'Style', 'text', 'String', metricNames{metricIndex});
@@ -840,7 +1005,8 @@ packet = struct('type', 63, 'pac_tx_cnt', rx + 1, 'pac_rx_cnt', rx, ...
 end
 
 function verify_locked(testCase, state)
-controls = [state.modulation_buttons(:); state.ip_edit; state.apply_ip_button; state.start_button];
+controls = [state.modulation_buttons(:); state.ip_edit; state.apply_ip_button; ...
+    state.start_button; state.file_name_edit];
 for control = controls.'
     testCase.verifyEqual(get(control, 'Enable'), 'off');
 end
@@ -852,11 +1018,19 @@ testCase.verifyFalse(state.running);
 testCase.verifyFalse(state.saving);
 testCase.verifyEmpty(state.client);
 testCase.verifyEmpty(state.request_timer);
-controls = [state.modulation_buttons(:); state.ip_edit; state.apply_ip_button; state.start_button];
+controls = [state.modulation_buttons(:); state.ip_edit; state.apply_ip_button; ...
+    state.start_button; state.file_name_edit];
 for control = controls.'
     testCase.verifyEqual(get(control, 'Enable'), 'on');
 end
 testCase.verifyEqual(get(state.stop_button, 'Enable'), 'off');
+if isempty(state.pending_capture)
+    testCase.verifyEqual(get(state.file_name_edit, 'BackgroundColor'), [1 1 1]);
+    testCase.verifyEqual(get(state.file_name_label, 'ForegroundColor'), [0.85 0.9 0.85]);
+else
+    testCase.verifyEqual(get(state.file_name_edit, 'BackgroundColor'), [1 0.96 0.80]);
+    testCase.verifyEqual(get(state.file_name_label, 'ForegroundColor'), [1 0.63 0.14]);
+end
 end
 
 function verify_unsaved(testCase, state, previousFiles)
@@ -869,6 +1043,9 @@ end
 testCase.assertNotEmpty(state.pending_capture);
 testCase.verifyEqual(get(state.save_button, 'Enable'), 'on');
 testCase.verifyEqual(get(state.save_button, 'BackgroundColor'), [1 0.63 0.14]);
+testCase.verifyEqual(get(state.file_name_edit, 'BackgroundColor'), [1 0.96 0.80]);
+testCase.verifyEqual(get(state.file_name_hint, 'BackgroundColor'), [1 0.96 0.80]);
+testCase.verifyEqual(get(state.file_name_label, 'ForegroundColor'), [1 0.63 0.14]);
 testCase.verifySubstring(get(state.status, 'String'), '未保存');
 end
 
@@ -890,6 +1067,9 @@ testCase.verifyClass(metadata, 'struct');
 testCase.verifyEqual(sort(fieldnames(points)), ...
     sort({'packet_start_index'; 'point_count'; 'i_raw'; 'q_raw'}));
 testCase.verifyEqual(metadata.format_version, 1);
+testCase.verifyClass(metadata.file_name_prefix, 'char');
+[~, folderName] = fileparts(folder);
+testCase.verifyEqual(metadata.record_folder_name, folderName);
 testCase.verifyEqual(string(metadata.start_time), format_test_time(capture.start_time));
 testCase.verifyEqual(string(metadata.end_time), format_test_time(capture.end_time));
 testCase.verifyEqual(metadata.duration_seconds, max(0, seconds(capture.end_time - capture.start_time)));
